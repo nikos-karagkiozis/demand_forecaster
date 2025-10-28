@@ -1,0 +1,159 @@
+{
+  "components": {
+    "comp-data-ingest-op": {
+      "executorLabel": "exec-data-ingest-op"
+    },
+    "comp-predict-op": {
+      "executorLabel": "exec-predict-op",
+      "inputDefinitions": {
+        "artifacts": {
+          "model_artifact": {
+            "artifactType": {
+              "schemaTitle": "system.Model",
+              "schemaVersion": "0.0.1"
+            }
+          }
+        }
+      }
+    },
+    "comp-train-op": {
+      "executorLabel": "exec-train-op",
+      "outputDefinitions": {
+        "artifacts": {
+          "model_artifact": {
+            "artifactType": {
+              "schemaTitle": "system.Model",
+              "schemaVersion": "0.0.1"
+            }
+          }
+        }
+      }
+    }
+  },
+  "defaultPipelineRoot": "gs://my-forecast-project-18870-staging/pipeline_root",
+  "deploymentSpec": {
+    "executors": {
+      "exec-data-ingest-op": {
+        "container": {
+          "args": [
+            "--executor_input",
+            "{{$}}",
+            "--function_to_execute",
+            "data_ingest_op"
+          ],
+          "command": [
+            "sh",
+            "-c",
+            "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip || python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'kfp==2.14.6' '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"$0\" \"$@\"\n",
+            "sh",
+            "-ec",
+            "program_path=$(mktemp -d)\n\nprintf \"%s\" \"$0\" > \"$program_path/ephemeral_component.py\"\n_KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         \"$program_path/ephemeral_component.py\"                         \"$@\"\n",
+            "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import *\n\ndef data_ingest_op():\n    \"\"\"Pipeline component to run the data ingestion script.\"\"\"\n    import subprocess\n    # The command to execute inside the container\n    # '-m' runs the module as a script\n    subprocess.run([\"python\", \"-m\", \"sales_forecast.data_ingest\"], check=True)\n\n"
+          ],
+          "image": "us-central1-docker.pkg.dev/my-forecast-project-18870/sales-forecast-repo/sales-forecast:latest"
+        }
+      },
+      "exec-predict-op": {
+        "container": {
+          "args": [
+            "--executor_input",
+            "{{$}}",
+            "--function_to_execute",
+            "predict_op"
+          ],
+          "command": [
+            "sh",
+            "-c",
+            "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip || python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'kfp==2.14.6' '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"$0\" \"$@\"\n",
+            "sh",
+            "-ec",
+            "program_path=$(mktemp -d)\n\nprintf \"%s\" \"$0\" > \"$program_path/ephemeral_component.py\"\n_KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         \"$program_path/ephemeral_component.py\"                         \"$@\"\n",
+            "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import *\n\ndef predict_op(model_artifact: dsl.Input[dsl.Model]): # Added model_artifact as an input\n    \"\"\"Pipeline component to run the prediction script using the trained model.\"\"\"\n    import subprocess\n    # Pass the path of the input artifact to the predict.py script\n    subprocess.run([\"python\", \"-m\", \"sales_forecast.predict\", \"--model-path\", model_artifact.path], check=True)\n\n"
+          ],
+          "image": "us-central1-docker.pkg.dev/my-forecast-project-18870/sales-forecast-repo/sales-forecast:latest"
+        }
+      },
+      "exec-train-op": {
+        "container": {
+          "args": [
+            "--executor_input",
+            "{{$}}",
+            "--function_to_execute",
+            "train_op"
+          ],
+          "command": [
+            "sh",
+            "-c",
+            "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip || python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'kfp==2.14.6' '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"$0\" \"$@\"\n",
+            "sh",
+            "-ec",
+            "program_path=$(mktemp -d)\n\nprintf \"%s\" \"$0\" > \"$program_path/ephemeral_component.py\"\n_KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         \"$program_path/ephemeral_component.py\"                         \"$@\"\n",
+            "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import *\n\ndef train_op(model_artifact: dsl.OutputPath(dsl.Model)):\n    \"\"\"Pipeline component to run the model training script and output the trained model.\"\"\"\n    import subprocess\n    # KFP automatically provides a path for output artifacts\n    subprocess.run([\"python\", \"-m\", \"sales_forecast.train\", \"--model-path\", model_artifact], check=True)\n\n"
+          ],
+          "image": "us-central1-docker.pkg.dev/my-forecast-project-18870/sales-forecast-repo/sales-forecast:latest"
+        }
+      }
+    }
+  },
+  "pipelineInfo": {
+    "description": "An end-to-end pipeline for ingesting, training, and predicting sales.",
+    "name": "sales-forecast-pipeline"
+  },
+  "root": {
+    "dag": {
+      "tasks": {
+        "data-ingest-op": {
+          "cachingOptions": {
+            "enableCache": true
+          },
+          "componentRef": {
+            "name": "comp-data-ingest-op"
+          },
+          "taskInfo": {
+            "name": "data-ingest-op"
+          }
+        },
+        "predict-op": {
+          "cachingOptions": {
+            "enableCache": true
+          },
+          "componentRef": {
+            "name": "comp-predict-op"
+          },
+          "dependentTasks": [
+            "train-op"
+          ],
+          "inputs": {
+            "artifacts": {
+              "model_artifact": {
+                "taskOutputArtifact": {
+                  "outputArtifactKey": "model_artifact",
+                  "producerTask": "train-op"
+                }
+              }
+            }
+          },
+          "taskInfo": {
+            "name": "predict-op"
+          }
+        },
+        "train-op": {
+          "cachingOptions": {
+            "enableCache": true
+          },
+          "componentRef": {
+            "name": "comp-train-op"
+          },
+          "dependentTasks": [
+            "data-ingest-op"
+          ],
+          "taskInfo": {
+            "name": "train-op"
+          }
+        }
+      }
+    }
+  },
+  "schemaVersion": "2.1.0",
+  "sdkVersion": "kfp-2.14.6"
+}
