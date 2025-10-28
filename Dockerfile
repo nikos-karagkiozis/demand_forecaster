@@ -39,4 +39,4 @@ ENV PATH="/app/.venv/bin:$PATH"
 COPY src/ ./src/
 
 # Set the PYTHONPATH to ensure the 'sales_forecast' module is importable
-ENV PYTHONPATH="/app"
+ENV PYTHONPATH="/app/src:/app"
