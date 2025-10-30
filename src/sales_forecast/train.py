@@ -18,6 +18,7 @@ import joblib
 import argparse # Added import for argparse
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from google.cloud import bigquery
+from google.cloud import storage
 import logging
 
 # Configure logging
@@ -69,7 +70,21 @@ def split_data_by_time(df: pd.DataFrame, test_size: float = 0.2) -> tuple[pd.Dat
     return train_df, val_df
 
 
-def main(model_output_path: str): # Modified main to accept model_output_path
+def upload_file_to_gcs(local_path: str, gcs_uri: str) -> None:
+    """Uploads a local file to the specified GCS URI (gs://bucket/path)."""
+    if not gcs_uri.startswith("gs://"):
+        raise ValueError("model_gcs_uri must start with 'gs://'")
+    parts = gcs_uri[5:].split("/", 1)
+    bucket_name = parts[0]
+    blob_name = parts[1] if len(parts) > 1 else os.path.basename(local_path)
+    client = storage.Client(project=config.bq.PROJECT_ID)
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(local_path)
+    logging.info(f"Uploaded model to {gcs_uri}")
+
+
+def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified to accept optional GCS uri
     """Main function to orchestrate the model training pipeline."""
     logging.info("Starting model training process...")
 
@@ -125,10 +140,14 @@ def main(model_output_path: str): # Modified main to accept model_output_path
     # KFP handles the creation of the directory for output artifacts
     joblib.dump(model, model_output_path) # Use the provided path
     logging.info(f"Model saved to {model_output_path}")
+    if model_gcs_uri:
+        upload_file_to_gcs(model_output_path, model_gcs_uri)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train sales forecasting model.")
     parser.add_argument("--model-path", type=str, required=True,
                         help="Path to save the trained model artifact.")
+    parser.add_argument("--model-gcs-uri", type=str, required=False,
+                        help="Optional GCS URI (gs://bucket/path) to upload the trained model.")
     args = parser.parse_args()
-    main(args.model_path) # Pass the parsed argument to main
+    main(args.model_path, getattr(args, "model_gcs_uri", None)) # Pass the parsed arguments to main

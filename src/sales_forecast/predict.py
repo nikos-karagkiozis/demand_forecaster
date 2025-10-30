@@ -11,10 +11,13 @@ It performs the following steps:
 6. Prints the prediction.
 """
 
+import os
+import tempfile
 import pandas as pd
 import joblib
 import argparse # Added import for argparse
 from google.cloud import bigquery
+from google.cloud import storage
 import logging
 from datetime import timedelta
 
@@ -26,16 +29,26 @@ from sales_forecast.config import config
 from sales_forecast.features import generate_features, prepare_dataset_for_modeling
 
 
+def download_file_from_gcs(gcs_uri: str, local_path: str) -> None:
+    """Downloads a file from GCS to a local path."""
+    if not gcs_uri.startswith("gs://"):
+        raise ValueError("model_gcs_uri must start with 'gs://'")
+    parts = gcs_uri[5:].split("/", 1)
+    bucket_name = parts[0]
+    blob_name = parts[1]
+    client = storage.Client(project=config.bq.PROJECT_ID)
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.download_to_filename(local_path)
+    logging.info(f"Downloaded model from {gcs_uri} to {local_path}")
+
+
 def load_model(path: str):
     """Loads a pre-trained model from a joblib file."""
     logging.info(f"Loading model from {path}...")
-    try:
-        model = joblib.load(path)
-        logging.info("Model loaded successfully.")
-        return model
-    except FileNotFoundError:
-        logging.error(f"Model file not found at {path}. Please run the training script first.")
-        raise
+    model = joblib.load(path)
+    logging.info("Model loaded successfully.")
+    return model
 
 
 def get_inference_data(client: bigquery.Client, table_ref: str, days: int = 30) -> pd.DataFrame:
@@ -68,12 +81,20 @@ def get_inference_data(client: bigquery.Client, table_ref: str, days: int = 30) 
         raise
 
 
-def main(model_input_path: str): # Modified main to accept model_input_path
+def main(model_input_path: str | None = None, model_gcs_uri: str | None = None): # Modified to support GCS
     """Main function to orchestrate the model prediction pipeline."""
     logging.info("Starting prediction process...")
 
-    # 1. Load Model
-    model = load_model(model_input_path) # Use the provided path
+    # 1. Resolve and load Model
+    if model_gcs_uri:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_model = os.path.join(tmpdir, "model.joblib")
+            download_file_from_gcs(model_gcs_uri, local_model)
+            model = load_model(local_model)
+    elif model_input_path:
+        model = load_model(model_input_path)
+    else:
+        raise ValueError("Provide either --model-path or --model-gcs-uri")
 
     # 2. Get recent data for feature calculation
     client = bigquery.Client(project=config.bq.PROJECT_ID)
@@ -99,7 +120,9 @@ def main(model_input_path: str): # Modified main to accept model_input_path
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Make sales forecast prediction.")
-    parser.add_argument("--model-path", type=str, required=True,
+    parser.add_argument("--model-path", type=str, required=False,
                         help="Path to load the trained model from.")
+    parser.add_argument("--model-gcs-uri", type=str, required=False,
+                        help="GCS URI (gs://bucket/path) to download the trained model from.")
     args = parser.parse_args()
-    main(args.model_path) # Pass the parsed argument to main
+    main(getattr(args, "model_path", None), getattr(args, "model_gcs_uri", None)) # Pass parsed arguments

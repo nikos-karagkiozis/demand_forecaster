@@ -25,7 +25,9 @@ dependencies = [
     "pydantic (>=2.12.3,<3.0.0)",
     "pydantic-settings (>=2.11.0,<3.0.0)",
     "kfp (>=2.7.0,<3.0.0)", 
-    "google-cloud-aiplatform (>=1.56.0,<2.0.0)" 
+    "google-cloud-aiplatform (>=1.56.0,<2.0.0)",
+    "fastapi (>=0.115.0,<1.0.0)",
+    "uvicorn[standard] (>=0.30.0,<1.0.0)" 
 ]
 
 

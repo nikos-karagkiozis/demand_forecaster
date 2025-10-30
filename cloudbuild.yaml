@@ -1,0 +1,66 @@
+substitutions:
+  _PROJECT_ID: "my-forecast-project-18870"
+  _REGION: "us-central1"
+  _REPO: "sales-forecast-repo"
+  _IMAGE: "sales-forecast"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  # Authenticate to Artifact Registry for the regional host
+  - name: gcr.io/cloud-builders/gcloud
+    id: "auth artifact registry"
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        gcloud auth configure-docker "${_REGION}-docker.pkg.dev" -q
+
+  # Build container
+  - name: gcr.io/cloud-builders/docker
+    id: "build image"
+    args:
+      ["build", "-t", "${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_IMAGE}:$COMMIT_SHA", "."]
+
+  # Push container
+  - name: gcr.io/cloud-builders/docker
+    id: "push image"
+    args:
+      ["push", "${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_IMAGE}:$COMMIT_SHA"]
+
+  # Compile KFP pipeline (runs inside a lightweight Python image)
+  - name: gcr.io/cloud-builders/gcloud
+    id: "compile pipeline"
+    entrypoint: bash
+    env:
+      - "PROJECT_ID=${_PROJECT_ID}"
+      - "REGION=${_REGION}"
+      - "DOCKER_IMAGE_URI=${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_IMAGE}:$COMMIT_SHA"
+      - "PIPELINE_ROOT=gs://${_PROJECT_ID}-staging/pipeline_root"
+    args:
+      - -c
+      - |
+        python3 -m pip install --quiet kfp google-cloud-aiplatform python-dotenv
+        python3 pipeline/forecast_pipeline.py
+
+  # Submit a pipeline run (optional: comment out to only build)
+  - name: gcr.io/cloud-builders/gcloud
+    id: "submit pipeline"
+    entrypoint: bash
+    env:
+      - "PROJECT_ID=${_PROJECT_ID}"
+      - "REGION=${_REGION}"
+    args:
+      - -c
+      - |
+        gcloud ai pipelines run \
+          --project=${_PROJECT_ID} \
+          --region=${_REGION} \
+          --pipeline-file=forecast_pipeline.json \
+          --display-name="sales-forecast-pipeline-$COMMIT_SHA" || true
+
+images:
+  - "${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_IMAGE}:$COMMIT_SHA"
+
+
