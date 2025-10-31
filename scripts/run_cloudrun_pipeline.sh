@@ -19,7 +19,7 @@ SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-ds-pipeline-sa@${PROJECT_ID}.iam.gserviceacc
 LOCATION="${LOCATION:-US}"
 
 # Model artifact location in GCS for cross-step sharing
-MODEL_GCS_URI="${MODEL_GCS_URI:-gs://${PROJECT_ID}-staging/model/model.joblib}"
+MODEL_GCS_URI="${MODEL_GCS_URI:-gs://${PROJECT_ID}-staging/models/model.joblib}"
 
 echo "Project:        ${PROJECT_ID}"
 echo "Region:         ${REGION}"
@@ -30,7 +30,24 @@ echo "Model GCS URI:  ${MODEL_GCS_URI}"
 gcloud config set project "${PROJECT_ID}" >/dev/null
 
 # Ensure services
-gcloud services enable run.googleapis.com artifactregistry.googleapis.com --project "${PROJECT_ID}" >/dev/null
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com aiplatform.googleapis.com --project "${PROJECT_ID}" >/dev/null
+
+# Ensure Artifact Registry repo exists (idempotent)
+if ! gcloud artifacts repositories describe "${REPO}" --location="${REGION}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud artifacts repositories create "${REPO}" \
+    --repository-format=docker \
+    --location="${REGION}" \
+    --description="Sales forecast repo"\
+    --project "${PROJECT_ID}"
+fi
+
+# Ensure the bucket for MODEL_GCS_URI exists (idempotent)
+if [[ "${MODEL_GCS_URI}" == gs://*/* ]]; then
+  BUCKET="$(echo "${MODEL_GCS_URI#gs://}" | cut -d/ -f1)"
+  if ! gsutil ls -b "gs://${BUCKET}" >/dev/null 2>&1; then
+    gsutil mb -l "${LOCATION}" "gs://${BUCKET}"
+  fi
+fi
 
 # Build & push image if not present
 gcloud auth configure-docker "${REGION}-docker.pkg.dev" -q
