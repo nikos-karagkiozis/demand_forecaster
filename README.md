@@ -165,6 +165,30 @@ Or use the helper script (builds/pushes image, compiles, submits):
 ```
 
 
+### Pipeline artifacts vs model artifacts (PIPELINE_ROOT vs models directory)
+
+- **PIPELINE_ROOT** is a GCS prefix where Vertex/KFP stores run-time execution data: component outputs (artifacts), logs, and metadata for each pipeline run.
+  - Defined in code and in the compiled JSON as `defaultPipelineRoot`.
+  - Example: `gs://<project>-staging/pipeline_root/<run-id>/artifacts/...`.
+  - This is managed per-run and can be cleaned up independently of serving.
+- **Compiled pipeline JSON (`forecast_pipeline.json`)** is a local file generated when compiling the pipeline. It is not stored under `PIPELINE_ROOT`.
+- **Model artifacts for serving** are promoted to a separate, stable GCS location (e.g., `gs://<project>-staging/models/run-<run-id>/model.joblib`) before registration.
+  - Reason: separation of concerns, clearer versioning, stable URIs for serving, and independence from pipeline-run lifecycle.
+  - You technically could point the Model Registry to a path inside `PIPELINE_ROOT`, but this couples serving to run retention/cleanup and is not recommended.
+
+### How KFP artifacts are passed (dsl.OutputPath / dsl.Input)
+
+- Declaring a parameter as `dsl.OutputPath(dsl.Model)` makes KFP inject a writable file path at runtime. Your code should save the model to that path.
+- Downstream steps receive `dsl.Input[dsl.Model]` and should read via `.path`.
+- The training step in this repo saves to the injected output path; Vertex mirrors that artifact under `PIPELINE_ROOT` for the run.
+
+### Registration uses a pointer, not a file copy
+
+- The pipeline copies the trained model from the KFP artifact to a stable models folder in GCS and builds an `artifact_uri` (directory) for registration.
+- `aiplatform.Model.upload(artifact_uri=...)` creates a Model Registry entry that references your GCS folder; it does not re-upload the file.
+- During deployment/serving, Vertex sets `AIP_STORAGE_URI` in your container so the app can download the model from that GCS location.
+
+
 ## Alternative: Cloud Run Jobs orchestration
 - Code: `scripts/run_cloudrun_pipeline.sh`
 - Creates three Cloud Run Jobs (ingest → train → predict) and executes them sequentially.

@@ -85,6 +85,33 @@ What happens when you run `./scripts/deploy_and_run.sh`:
        - Looks up the latest registered model by display name and deploys it to an endpoint (creating the endpoint if needed) with your machine type and replica settings.
        - After completion: an online Endpoint is live and ready for real-time predictions.
 
+### Where artifacts live and why (PIPELINE_ROOT vs models directory)
+
+- **PIPELINE_ROOT** (e.g., `gs://<project>-staging/pipeline_root`) stores per-run artifacts, logs, and metadata produced by KFP. Paths are run-scoped, e.g., `.../pipeline_root/<run-id>/artifacts/...`.
+- **Models directory** (e.g., `gs://<project>-staging/models/run-<run-id>/model.joblib`) is a stable, promoted location used for registration/serving.
+- **Why keep them separate?**
+  - Pipeline runs can be pruned without breaking serving.
+  - Clear versioning and discoverability for serving artifacts.
+  - Avoids coupling serving to KFP’s internal artifact layout.
+  - Aligns with build → promote → deploy best practices.
+
+### How artifacts flow between steps (KFP)
+
+- `dsl.OutputPath(dsl.Model)` (in `train_op`) makes KFP inject a writable file path; the training code saves the model there.
+- `dsl.Input[dsl.Model]` (in `predict_op`/`register_and_deploy_op`) provides access to the saved artifact via `.path`.
+- Vertex mirrors these artifacts under `PIPELINE_ROOT` and wires them between steps.
+
+### What model registration actually stores
+
+- Registration uses `aiplatform.Model.upload(artifact_uri=...)` to create a Model Registry entry that references your GCS folder.
+- The Model Registry does not copy your model file; it stores metadata and a pointer (the `artifact_uri`) plus the serving container image URI.
+
+### Endpoint creation vs deployment, and how the container is used
+
+- **Create endpoint**: makes an API surface (no model yet).
+- **Deploy model**: Vertex spins up one or more replicas of your serving container image, sets `AIP_STORAGE_URI` inside each, and your app downloads/loads `model.joblib` from GCS at startup or on first request.
+- The same serving image defined during registration is the one Vertex runs at deployment time.
+
 Notes and outcomes:
 - After the pipeline run, your final BigQuery table exists; a trained model artifact exists in GCS (pipeline root and/or the models directory); optionally (if enabled), a Vertex AI Endpoint exists and serves predictions.
 - To call the live endpoint later, use `scripts/endpoint_predict.py` or the demo notebook.
@@ -190,6 +217,22 @@ Notes and outcomes:
 - Model artifact: `model.joblib` saved to Vertex AI pipeline artifacts (if using pipelines) and/or uploaded to GCS (if configured).
 - Online prediction: requests go to Vertex AI Endpoint and responses are returned to the caller; not stored by default.
 - Batch prediction (optional): if you run `scripts/batch_predict.py` with BigQuery output configured, predictions are written to BigQuery; if configured for GCS output, predictions are written to the specified GCS prefix.
+
+---
+
+## FAQ
+
+- **Can I register a model using a path under `PIPELINE_ROOT`?**
+  - Technically yes, but it’s discouraged because pipeline-run cleanup could delete artifacts and break serving. Promote models to a stable `gs://.../models/...` URI before registration.
+
+- **Is the model uploaded twice during registration?**
+  - No. The pipeline uploads the file once to the models directory in GCS. Registration stores a pointer to that URI; it does not duplicate the file.
+
+- **Where is the compiled pipeline JSON stored?**
+  - Locally as `forecast_pipeline.json` when you compile. It references `PIPELINE_ROOT` in its `defaultPipelineRoot`, but the JSON itself is not stored in `PIPELINE_ROOT`.
+
+- **How do KFP artifact parameters work?**
+  - Output artifacts receive an injected path (`dsl.OutputPath(...)`) to write to; input artifacts are accessed via `.path` on `dsl.Input[...]` parameters. KFP mirrors these under `PIPELINE_ROOT`.
 
 ---
 
