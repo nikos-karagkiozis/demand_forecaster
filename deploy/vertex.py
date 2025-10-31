@@ -115,7 +115,8 @@ def deploy_model(
     endpoint = get_or_create_endpoint(project_id, region, endpoint_display_name, endpoint_id)
     model = aiplatform.Model(model_resource_name)
 
-    deployed_model = model.deploy(
+    # Note: Model.deploy returns the Endpoint object in the Python SDK
+    endpoint = model.deploy(
         endpoint=endpoint,
         machine_type=machine_type,
         min_replica_count=min_replicas,
@@ -125,8 +126,9 @@ def deploy_model(
         sync=True,
     )
 
-    print("Deployed model id:", deployed_model.id)
-    print("Endpoint:", endpoint.resource_name)
+    # The 'id' of the DeployedModel can be found via endpoint.gca_resource.deployed_models.
+    # For simplicity we print the endpoint resource name which uniquely identifies where the model is deployed.
+    print("Deployed to Endpoint:", endpoint.resource_name)
     return endpoint
 
 
