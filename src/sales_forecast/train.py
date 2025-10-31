@@ -20,6 +20,8 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, r
 from google.cloud import bigquery
 from google.cloud import storage
 import logging
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -84,6 +86,34 @@ def upload_file_to_gcs(local_path: str, gcs_uri: str) -> None:
     logging.info(f"Uploaded model to {gcs_uri}")
 
 
+def _derive_artifact_dir_from_model_gcs_uri(model_gcs_uri: str) -> str:
+    """Return the artifact directory (gs://bucket/prefix/) from a model GCS URI which may be a file.
+
+    Examples:
+      - gs://bucket/models/model.joblib -> gs://bucket/models/
+      - gs://bucket/models/run-123/model.joblib -> gs://bucket/models/run-123/
+      - gs://bucket/models/ -> gs://bucket/models/
+    """
+    if not model_gcs_uri.startswith("gs://"):
+        raise ValueError("model_gcs_uri must start with 'gs://'")
+    # If it ends with a slash, assume it's already a directory
+    if model_gcs_uri.endswith("/"):
+        return model_gcs_uri
+    # Otherwise, strip the last path component (filename)
+    bucket_and_path = model_gcs_uri[5:]
+    if "/" not in bucket_and_path:
+        # Only bucket provided; append trailing slash
+        return model_gcs_uri + "/"
+    bucket = bucket_and_path.split("/", 1)[0]
+    path = bucket_and_path.split("/", 1)[1]
+    # dirname of path
+    if "/" in path:
+        dir_path = path.rsplit("/", 1)[0] + "/"
+    else:
+        dir_path = ""
+    return f"gs://{bucket}/{dir_path}"
+
+
 def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified to accept optional GCS uri
     """Main function to orchestrate the model training pipeline."""
     logging.info("Starting model training process...")
@@ -142,6 +172,97 @@ def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified t
     logging.info(f"Model saved to {model_output_path}")
     if model_gcs_uri:
         upload_file_to_gcs(model_output_path, model_gcs_uri)
+
+    # 7. Generate and persist plots (validation + training quick checks)
+    try:
+        os.makedirs("/tmp/plots", exist_ok=True)
+
+        # Actual vs predicted (validation)
+        val_plot_path = "/tmp/plots/actual_vs_pred_val.png"
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(val_df["Date"], y_val.values, label="actual", linewidth=2)
+        ax.plot(val_df["Date"], preds, label="pred", linewidth=2)
+        ax.set_title("Validation: Actual vs Predicted")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(val_plot_path, dpi=150)
+        plt.close(fig)
+
+        # Predicted vs actual scatter (validation)
+        scatter_path = "/tmp/plots/pred_vs_actual_val.png"
+        fig, ax = plt.subplots(figsize=(6, 6))
+        sns.scatterplot(x=y_val.values, y=preds, ax=ax)
+        lims = [min(y_val.min(), preds.min()), max(y_val.max(), preds.max())]
+        ax.plot(lims, lims, "r--", linewidth=1)
+        ax.set_xlabel("Actual")
+        ax.set_ylabel("Predicted")
+        ax.set_title("Validation: Predicted vs Actual")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(scatter_path, dpi=150)
+        plt.close(fig)
+
+        # Residuals histogram (validation)
+        resid_path = "/tmp/plots/residuals_hist_val.png"
+        residuals = preds - y_val.values
+        fig, ax = plt.subplots(figsize=(8, 4))
+        sns.histplot(residuals, bins=30, kde=True, ax=ax)
+        ax.set_title("Validation Residuals Histogram")
+        ax.set_xlabel("Residual (pred - actual)")
+        fig.tight_layout()
+        fig.savefig(resid_path, dpi=150)
+        plt.close(fig)
+
+        # Feature importance
+        fi_path = "/tmp/plots/feature_importance.png"
+        try:
+            importances = getattr(model, "feature_importances_", None)
+            if importances is not None:
+                fi = pd.DataFrame({
+                    "feature": X_train.columns,
+                    "importance": importances
+                }).sort_values("importance", ascending=False).head(30)
+                fig, ax = plt.subplots(figsize=(10, max(4, len(fi) * 0.3)))
+                sns.barplot(data=fi, x="importance", y="feature", ax=ax, orient="h")
+                ax.set_title("Feature Importance (top 30)")
+                fig.tight_layout()
+                fig.savefig(fi_path, dpi=150)
+                plt.close(fig)
+        except Exception as e:
+            logging.warning(f"Skipping feature importance plot: {e}")
+
+        # Optional: training overlay (quick check)
+        try:
+            y_train_pred = model.predict(X_train)
+            train_plot_path = "/tmp/plots/actual_vs_pred_train.png"
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.plot(train_df["Date"], y_train.values, label="actual", linewidth=1)
+            ax.plot(train_df["Date"], y_train_pred, label="pred", linewidth=1)
+            ax.set_title("Train: Actual vs Predicted")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(train_plot_path, dpi=150)
+            plt.close(fig)
+        except Exception as e:
+            logging.warning(f"Skipping training overlay plot: {e}")
+
+        # Upload plots to GCS alongside the model, if a target directory is known
+        target_gcs_dir = None
+        if model_gcs_uri:
+            target_gcs_dir = _derive_artifact_dir_from_model_gcs_uri(model_gcs_uri)
+        elif os.environ.get("MODEL_GCS_URI"):
+            target_gcs_dir = _derive_artifact_dir_from_model_gcs_uri(os.environ["MODEL_GCS_URI"])
+
+        if target_gcs_dir:
+            for local_path in [val_plot_path, scatter_path, resid_path, fi_path]:
+                if os.path.exists(local_path):
+                    gcs_uri = target_gcs_dir.rstrip("/") + "/plots/" + os.path.basename(local_path)
+                    upload_file_to_gcs(local_path, gcs_uri)
+                    logging.info(f"Uploaded plot to {gcs_uri}")
+    except Exception as e:
+        logging.warning(f"Plot generation/upload skipped due to error: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train sales forecasting model.")

@@ -20,6 +20,8 @@ from google.cloud import bigquery
 from google.cloud import storage
 import logging
 from datetime import timedelta
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -41,6 +43,34 @@ def download_file_from_gcs(gcs_uri: str, local_path: str) -> None:
     blob = bucket.blob(blob_name)
     blob.download_to_filename(local_path)
     logging.info(f"Downloaded model from {gcs_uri} to {local_path}")
+
+
+def upload_file_to_gcs(local_path: str, gcs_uri: str) -> None:
+    if not gcs_uri.startswith("gs://"):
+        raise ValueError("gcs_uri must start with 'gs://'")
+    bucket_name, blob_name = gcs_uri[5:].split("/", 1)
+    client = storage.Client(project=config.bq.PROJECT_ID)
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(local_path)
+    logging.info(f"Uploaded file to {gcs_uri}")
+
+
+def _derive_artifact_dir_from_model_gcs_uri(model_gcs_uri: str) -> str:
+    if not model_gcs_uri.startswith("gs://"):
+        raise ValueError("model_gcs_uri must start with 'gs://'")
+    if model_gcs_uri.endswith("/"):
+        return model_gcs_uri
+    bucket_and_path = model_gcs_uri[5:]
+    if "/" not in bucket_and_path:
+        return model_gcs_uri + "/"
+    bucket = bucket_and_path.split("/", 1)[0]
+    path = bucket_and_path.split("/", 1)[1]
+    if "/" in path:
+        dir_path = path.rsplit("/", 1)[0] + "/"
+    else:
+        dir_path = ""
+    return f"gs://{bucket}/{dir_path}"
 
 
 def load_model(path: str):
@@ -124,6 +154,35 @@ def main(model_input_path: str | None = None, model_gcs_uri: str | None = None):
     # 7. Make Prediction
     prediction = model.predict(X_pred)
     logging.info(f"Predicted sales for {prediction_date.date()}: {prediction[0]:.2f}")
+
+    # 8. Plot last window actuals and the forecast point, upload alongside the model if possible
+    try:
+        os.makedirs("/tmp/plots", exist_ok=True)
+        # Exclude the future row (last one after feature gen)
+        hist_df = featured_df.iloc[:-1].copy()
+        forecast_plot = "/tmp/plots/forecast_overlay.png"
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(hist_df["Date"], hist_df[config.features.TARGET_COL], label="actual (last window)", linewidth=2)
+        ax.scatter([prediction_date], [float(prediction[0])], color="red", label="forecast (next day)")
+        ax.set_title("Forecast Overlay: last window actuals and next-day forecast")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(forecast_plot, dpi=150)
+        plt.close(fig)
+
+        target_gcs_dir = None
+        if model_gcs_uri:
+            target_gcs_dir = _derive_artifact_dir_from_model_gcs_uri(model_gcs_uri)
+        elif os.environ.get("MODEL_GCS_URI"):
+            target_gcs_dir = _derive_artifact_dir_from_model_gcs_uri(os.environ["MODEL_GCS_URI"])
+
+        if target_gcs_dir:
+            gcs_uri = target_gcs_dir.rstrip("/") + "/plots/" + os.path.basename(forecast_plot)
+            upload_file_to_gcs(forecast_plot, gcs_uri)
+            logging.info(f"Uploaded forecast plot to {gcs_uri}")
+    except Exception as e:
+        logging.warning(f"Plot generation/upload skipped due to error: {e}")
 
 
 if __name__ == "__main__":
