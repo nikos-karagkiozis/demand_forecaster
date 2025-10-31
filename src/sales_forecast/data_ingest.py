@@ -84,7 +84,6 @@ AS SELECT
   wspd,
   pres,
   CAST(is_holiday AS INT64) AS is_holiday,
-  holiday_name,
   CAST(is_school_break AS INT64) AS is_school_break,
   dinner_impact_score,
   importance_score,
