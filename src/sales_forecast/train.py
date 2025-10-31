@@ -238,7 +238,7 @@ def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified t
 
         # Optional: training overlay (quick check)
         try:
-        y_train_pred = model.predict(X_train, num_iteration=best_iter)
+            y_train_pred = model.predict(X_train, num_iteration=best_iter)
             train_plot_path = "/tmp/plots/actual_vs_pred_train.png"
             fig, ax = plt.subplots(figsize=(10, 5))
             ax.plot(train_df["Date"], y_train.values, label="actual", linewidth=1)
