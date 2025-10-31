@@ -29,6 +29,11 @@ FROM python:3.12-slim AS final
 # Set the working directory
 WORKDIR /app
 
+# System dependencies needed at runtime (e.g., LightGBM needs libgomp)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy the virtual environment from the builder stage
 COPY --from=builder /app/.venv ./.venv
 
