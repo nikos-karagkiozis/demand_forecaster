@@ -113,7 +113,15 @@ def main(model_input_path: str | None = None, model_gcs_uri: str | None = None):
     # 5. Isolate the feature set for the prediction date
     X_pred, _ = prepare_dataset_for_modeling(featured_df.tail(1), config.features.TARGET_COL)
 
-    # 6. Make Prediction
+|   # 6. Align features to the model's expected schema (handle missing one-hot cols, order)
+    feature_names = getattr(model, "feature_name_", None)
+    if feature_names:
+        for c in feature_names:
+            if c not in X_pred.columns:
+                X_pred[c] = 0
+        X_pred = X_pred[feature_names]
+
+    # 7. Make Prediction
     prediction = model.predict(X_pred)
     logging.info(f"Predicted sales for {prediction_date.date()}: {prediction[0]:.2f}")
 
