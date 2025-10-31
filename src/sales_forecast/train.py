@@ -16,7 +16,7 @@ import pandas as pd
 import lightgbm as lgb
 import joblib
 import argparse # Added import for argparse
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, root_mean_squared_error
 from google.cloud import bigquery
 from google.cloud import storage
 import logging
@@ -128,7 +128,7 @@ def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified t
     # 5. Model Evaluation
     logging.info("Evaluating model performance...")
     preds = model.predict(X_val)
-    rmse = mean_squared_error(y_val, preds, squared=False)
+    rmse = root_mean_squared_error(y_val, preds)
     mae = mean_absolute_error(y_val, preds)
     r2 = r2_score(y_val, preds)
 
