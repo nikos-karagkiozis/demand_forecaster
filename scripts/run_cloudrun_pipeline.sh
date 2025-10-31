@@ -72,21 +72,21 @@ cr_job_upsert "sf-data-ingest" \
   --service-account "${SERVICE_ACCOUNT}" \
   --set-env-vars "${COMMON_ENVS}" \
   --command python \
-  --args -m,sales_forecast.data_ingest
+  --args="-m,sales_forecast.data_ingest"
 
 # 2) Train job (saves locally then uploads to GCS)
 cr_job_upsert "sf-train" \
   --service-account "${SERVICE_ACCOUNT}" \
   --set-env-vars "${COMMON_ENVS}" \
   --command python \
-  --args -m,sales_forecast.train,--model-path,/tmp/model.joblib,--model-gcs-uri,${MODEL_GCS_URI}
+  --args="-m,sales_forecast.train,--model-path,/tmp/model.joblib,--model-gcs-uri,${MODEL_GCS_URI}"
 
 # 3) Predict job (downloads from GCS)
 cr_job_upsert "sf-predict" \
   --service-account "${SERVICE_ACCOUNT}" \
   --set-env-vars "${COMMON_ENVS}" \
   --command python \
-  --args -m,sales_forecast.predict,--model-gcs-uri,${MODEL_GCS_URI}
+  --args="-m,sales_forecast.predict,--model-gcs-uri,${MODEL_GCS_URI}"
 
 # Execute sequentially and wait for completion
 gcloud run jobs execute sf-data-ingest --region "${REGION}" --wait
