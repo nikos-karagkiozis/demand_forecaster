@@ -77,12 +77,6 @@ def health() -> Dict[str, str]:
     return {"status": "healthy"}
 
 
-# Some Vertex components may probe a versioned path. Return 200 to unknown v1 probe paths.
-@app.get("/v1/endpoints/{endpoint_id}/deployedModels/{deployed_model_id}")
-def vertex_probe(endpoint_id: str, deployed_model_id: str) -> Dict[str, str]:
-    return {"status": "ok", "endpoint": endpoint_id, "deployed_model": deployed_model_id}
-
-
 @app.post("/predict")
 def predict(req: PredictRequest) -> Dict[str, Any]:
     try:

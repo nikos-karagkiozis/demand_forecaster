@@ -132,8 +132,6 @@ def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified t
 
     X_train, y_train = prepare_dataset_for_modeling(train_df, config.features.TARGET_COL)
     X_val, y_val = prepare_dataset_for_modeling(val_df, config.features.TARGET_COL)
-    # Ensure validation columns align to training (order + any missing filled with 0)
-    X_val = X_val.reindex(columns=X_train.columns, fill_value=0)
 
     # 4. Model Training
     logging.info("Training LightGBM model...")
@@ -159,9 +157,7 @@ def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified t
 
     # 5. Model Evaluation
     logging.info("Evaluating model performance...")
-    # Use best iteration if available (after early stopping)
-    best_iter = getattr(model, "best_iteration_", None)
-    preds = model.predict(X_val, num_iteration=best_iter)
+    preds = model.predict(X_val)
     rmse = root_mean_squared_error(y_val, preds)
     mae = mean_absolute_error(y_val, preds)
     r2 = r2_score(y_val, preds)
@@ -238,7 +234,7 @@ def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified t
 
         # Optional: training overlay (quick check)
         try:
-            y_train_pred = model.predict(X_train, num_iteration=best_iter)
+            y_train_pred = model.predict(X_train)
             train_plot_path = "/tmp/plots/actual_vs_pred_train.png"
             fig, ax = plt.subplots(figsize=(10, 5))
             ax.plot(train_df["Date"], y_train.values, label="actual", linewidth=1)
