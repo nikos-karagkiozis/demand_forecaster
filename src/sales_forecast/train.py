@@ -12,6 +12,7 @@ It performs the following steps:
 """
 
 import os
+import json
 import pandas as pd
 import lightgbm as lgb
 import joblib
@@ -114,7 +115,39 @@ def _derive_artifact_dir_from_model_gcs_uri(model_gcs_uri: str) -> str:
     return f"gs://{bucket}/{dir_path}"
 
 
-def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified to accept optional GCS uri
+def _report_hpt_metric(metric_name: str, value: float, step: int = 0) -> None:
+    """Report the objective metric for Vertex AI Hyperparameter Tuning.
+
+    Tries the hypertune library first (if available), otherwise emits a JSON line
+    that Vertex can parse from logs.
+    """
+    try:
+        # AI Platform/Vertex-compatible hypertune library (if installed)
+        import hypertune  # type: ignore
+
+        ht = hypertune.HyperTune()
+        # Use the legacy argument names to maximize compatibility
+        ht.report_hyperparameter_tuning_metric(
+            hyperparameter_metric_tag=metric_name,
+            metric_value=float(value),
+            global_step=step,
+        )
+        return
+    except Exception:
+        # Fallback: structured JSON log line
+        try:
+            print(json.dumps({"metric": metric_name, "value": float(value), "step": int(step)}))
+        except Exception:
+            # Last resort: simple key=value line
+            print(f"{metric_name}={float(value)}")
+
+
+def main(
+    model_output_path: str,
+    model_gcs_uri: str | None = None,
+    hparams: dict | None = None,
+    hpt_metric_name: str | None = None,
+): # Modified to accept optional GCS uri and HPT params
     """Main function to orchestrate the model training pipeline."""
     logging.info("Starting model training process...")
 
@@ -148,12 +181,17 @@ def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified t
         'seed': 42,
         'boosting_type': 'gbdt',
     }
+    # Apply externally provided hyperparameters (e.g., from Vertex HPT trials)
+    if hparams:
+        for k, v in hparams.items():
+            if v is not None:
+                lgbm_params[k] = v
 
     model = lgb.LGBMRegressor(**lgbm_params)
     model.fit(X_train, y_train,
               eval_set=[(X_val, y_val)],
-              eval_metric='mae',
-              callbacks=[lgb.early_stopping(100, verbose=True)])
+              eval_metric=lgbm_params.get('metric', 'mae'),
+              callbacks=[lgb.early_stopping(int(os.environ.get('EARLY_STOPPING_ROUNDS', '100')), verbose=True)])
 
     # 5. Model Evaluation
     logging.info("Evaluating model performance...")
@@ -165,6 +203,20 @@ def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified t
     logging.info(f"Validation RMSE: {rmse:.4f}")
     logging.info(f"Validation MAE: {mae:.4f}")
     logging.info(f"Validation R^2: {r2:.4f}")
+
+    # 5b. Optionally report a single objective metric for Vertex HPT
+    metric_name = hpt_metric_name or os.environ.get("HPT_METRIC_NAME")
+    if metric_name:
+        metric_name_lower = metric_name.lower()
+        if metric_name_lower in ("mae", "l1"):
+            _report_hpt_metric("mae", float(mae), step=1)
+        elif metric_name_lower in ("rmse", "l2"):
+            _report_hpt_metric("rmse", float(rmse), step=1)
+        elif metric_name_lower in ("r2", "r2_score"):
+            _report_hpt_metric("r2", float(r2), step=1)
+        else:
+            # Default to MAE if unknown
+            _report_hpt_metric(metric_name, float(mae), step=1)
 
     # 6. Save Model
     # KFP handles the creation of the directory for output artifacts
@@ -270,5 +322,47 @@ if __name__ == "__main__":
                         help="Path to save the trained model artifact.")
     parser.add_argument("--model-gcs-uri", type=str, required=False,
                         help="Optional GCS URI (gs://bucket/path) to upload the trained model.")
+    # Hyperparameters (Vertex HPT passes values via these flags)
+    parser.add_argument("--objective", type=str, required=False)
+    parser.add_argument("--metric", type=str, required=False)
+    parser.add_argument("--n-estimators", dest="n_estimators", type=int, required=False)
+    parser.add_argument("--learning-rate", dest="learning_rate", type=float, required=False)
+    parser.add_argument("--num-leaves", dest="num_leaves", type=int, required=False)
+    parser.add_argument("--max-depth", dest="max_depth", type=int, required=False)
+    parser.add_argument("--min-child-samples", dest="min_child_samples", type=int, required=False)
+    parser.add_argument("--feature-fraction", dest="feature_fraction", type=float, required=False)
+    parser.add_argument("--bagging-fraction", dest="bagging_fraction", type=float, required=False)
+    parser.add_argument("--bagging-freq", dest="bagging_freq", type=int, required=False)
+    parser.add_argument("--lambda-l1", dest="lambda_l1", type=float, required=False)
+    parser.add_argument("--lambda-l2", dest="lambda_l2", type=float, required=False)
+    parser.add_argument("--min-split-gain", dest="min_split_gain", type=float, required=False)
+    parser.add_argument("--boosting-type", dest="boosting_type", type=str, required=False)
+    parser.add_argument("--seed", dest="seed", type=int, required=False)
+    parser.add_argument("--n-jobs", dest="n_jobs", type=int, required=False)
+    parser.add_argument("--early-stopping-rounds", dest="early_stopping_rounds", type=int, required=False,
+                        help="If provided, overrides EARLY_STOPPING_ROUNDS env and default (100).")
+    # Vertex HPT metric name to report (e.g., mae, rmse, r2)
+    parser.add_argument("--hpt-metric-name", dest="hpt_metric_name", type=str, required=False,
+                        help="Objective metric name to report to Vertex HPT (e.g., mae, rmse, r2)")
     args = parser.parse_args()
-    main(args.model_path, getattr(args, "model_gcs_uri", None)) # Pass the parsed arguments to main
+    # If user provided early stopping rounds via CLI, set env so the callback picks it up
+    if getattr(args, "early_stopping_rounds", None) is not None:
+        os.environ["EARLY_STOPPING_ROUNDS"] = str(args.early_stopping_rounds)
+
+    # Collect provided hparams only (None means use defaults)
+    cli_hparams = {}
+    for key in [
+        "objective", "metric", "n_estimators", "learning_rate", "num_leaves", "max_depth",
+        "min_child_samples", "feature_fraction", "bagging_fraction", "bagging_freq",
+        "lambda_l1", "lambda_l2", "min_split_gain", "boosting_type", "seed", "n_jobs",
+    ]:
+        val = getattr(args, key, None)
+        if val is not None:
+            cli_hparams[key] = val
+
+    main(
+        args.model_path,
+        getattr(args, "model_gcs_uri", None),
+        hparams=cli_hparams if cli_hparams else None,
+        hpt_metric_name=getattr(args, "hpt_metric_name", None),
+    ) # Pass parsed arguments and optional HPT params to main

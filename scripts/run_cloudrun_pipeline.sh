@@ -17,6 +17,15 @@ DOCKER_IMAGE_URI="${DOCKER_IMAGE_URI:-${REGION}-docker.pkg.dev/${PROJECT_ID}/${R
 PIPELINE_ROOT="${PIPELINE_ROOT:-gs://${PROJECT_ID}-staging/pipeline_root}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-ds-pipeline-sa@${PROJECT_ID}.iam.gserviceaccount.com}"
 LOCATION="${LOCATION:-US}"
+ENABLE_HPT="${ENABLE_HPT:-false}"
+HPT_MAX_TRIALS="${HPT_MAX_TRIALS:-20}"
+HPT_PARALLEL_TRIALS="${HPT_PARALLEL_TRIALS:-4}"
+HPT_METRIC_NAME="${HPT_METRIC_NAME:-mae}"
+HPT_METRIC_GOAL="${HPT_METRIC_GOAL:-minimize}"
+HPT_MACHINE_TYPE="${HPT_MACHINE_TYPE:-n1-standard-4}"
+BEST_PARAMS_URI="${BEST_PARAMS_URI:-gs://${PROJECT_ID}-staging/hpt/best_params.json}"
+HPT_PARAM_SPACE_GCS="${HPT_PARAM_SPACE_GCS:-}"
+HPT_PARAM_SPACE_JSON="${HPT_PARAM_SPACE_JSON:-}"
 
 # Model artifact location in GCS for cross-step sharing
 MODEL_GCS_URI="${MODEL_GCS_URI:-gs://${PROJECT_ID}-staging/models/model.joblib}"
@@ -26,6 +35,7 @@ echo "Region:         ${REGION}"
 echo "Image URI:      ${DOCKER_IMAGE_URI}"
 echo "Service acct:   ${SERVICE_ACCOUNT}"
 echo "Model GCS URI:  ${MODEL_GCS_URI}"
+echo "Enable HPT:     ${ENABLE_HPT}"
 
 gcloud config set project "${PROJECT_ID}" >/dev/null
 
@@ -88,9 +98,84 @@ cr_job_upsert "sf-predict" \
   --command python \
   --args="-m,sales_forecast.predict,--model-gcs-uri,${MODEL_GCS_URI}"
 
+# 4) Optional: HPT submitter job and train-with-best job
+if [[ "${ENABLE_HPT,,}" == "true" || "${ENABLE_HPT}" == "1" || "${ENABLE_HPT,,}" == "yes" || "${ENABLE_HPT,,}" == "on" ]]; then
+  # Ensure the bucket for BEST_PARAMS_URI exists
+  if [[ "${BEST_PARAMS_URI}" == gs://*/* ]]; then
+    BUCKET_BEST="$(echo "${BEST_PARAMS_URI#gs://}" | cut -d/ -f1)"
+    if ! gsutil ls -b "gs://${BUCKET_BEST}" >/dev/null 2>&1; then
+      gsutil mb -l "${LOCATION}" "gs://${BUCKET_BEST}"
+    fi
+  fi
+
+  cr_job_upsert "sf-hpt" \
+    --service-account "${SERVICE_ACCOUNT}" \
+    --set-env-vars "${COMMON_ENVS}" \
+    --command python \
+    --args="scripts/submit_hpt.py,\
+--project-id,${PROJECT_ID},\
+--region,${REGION},\
+--image-uri,${DOCKER_IMAGE_URI},\
+--service-account,${SERVICE_ACCOUNT},\
+--display-name,sf-hpt,\
+--metric-name,${HPT_METRIC_NAME},\
+--metric-goal,${HPT_METRIC_GOAL},\
+--max-trials,${HPT_MAX_TRIALS},\
+--parallel-trials,${HPT_PARALLEL_TRIALS},\
+--machine-type,${HPT_MACHINE_TYPE},\
+--best-params-output-gcs,${BEST_PARAMS_URI}"
+
+  # Append optional param space flags if provided
+  if [[ -n "${HPT_PARAM_SPACE_GCS}" ]]; then
+    gcloud run jobs update "sf-hpt" --region "${REGION}" \
+      --args="scripts/submit_hpt.py,\
+--project-id,${PROJECT_ID},\
+--region,${REGION},\
+--image-uri,${DOCKER_IMAGE_URI},\
+--service-account,${SERVICE_ACCOUNT},\
+--display-name,sf-hpt,\
+--metric-name,${HPT_METRIC_NAME},\
+--metric-goal,${HPT_METRIC_GOAL},\
+--max-trials,${HPT_MAX_TRIALS},\
+--parallel-trials,${HPT_PARALLEL_TRIALS},\
+--machine-type,${HPT_MACHINE_TYPE},\
+--best-params-output-gcs,${BEST_PARAMS_URI},\
+--param-space-gcs,${HPT_PARAM_SPACE_GCS}" >/dev/null
+  elif [[ -n "${HPT_PARAM_SPACE_JSON}" ]]; then
+    gcloud run jobs update "sf-hpt" --region "${REGION}" \
+      --args="scripts/submit_hpt.py,\
+--project-id,${PROJECT_ID},\
+--region,${REGION},\
+--image-uri,${DOCKER_IMAGE_URI},\
+--service-account,${SERVICE_ACCOUNT},\
+--display-name,sf-hpt,\
+--metric-name,${HPT_METRIC_NAME},\
+--metric-goal,${HPT_METRIC_GOAL},\
+--max-trials,${HPT_MAX_TRIALS},\
+--parallel-trials,${HPT_PARALLEL_TRIALS},\
+--machine-type,${HPT_MACHINE_TYPE},\
+--best-params-output-gcs,${BEST_PARAMS_URI},\
+--param-space-json,${HPT_PARAM_SPACE_JSON}" >/dev/null
+  fi
+
+  cr_job_upsert "sf-train-best" \
+    --service-account "${SERVICE_ACCOUNT}" \
+    --set-env-vars "${COMMON_ENVS}" \
+    --command python \
+    --args="scripts/train_with_best_params.py,\
+--best-params-gcs-uri,${BEST_PARAMS_URI},\
+--model-path,/tmp/model.joblib,\
+--model-gcs-uri,${MODEL_GCS_URI}"
+fi
+
 # Execute sequentially and wait for completion
 gcloud run jobs execute sf-data-ingest --region "${REGION}" --wait
-gcloud run jobs execute sf-train --region "${REGION}" --wait
+if [[ "${ENABLE_HPT,,}" == "true" || "${ENABLE_HPT}" == "1" || "${ENABLE_HPT,,}" == "yes" || "${ENABLE_HPT,,}" == "on" ]]; then
+  gcloud run jobs execute sf-hpt --region "${REGION}" --wait
+  gcloud run jobs execute sf-train-best --region "${REGION}" --wait
+else
+  gcloud run jobs execute sf-train --region "${REGION}" --wait
+fi
 gcloud run jobs execute sf-predict --region "${REGION}" --wait
 
 echo "Cloud Run pipeline completed."
