@@ -114,9 +114,15 @@ def main() -> None:
     parser.add_argument("--param-space-gcs", required=False, help="gs:// path to JSON with parameter space")
     parser.add_argument("--best-params-output-gcs", required=True, help="Where to write best params JSON (gs:// or local path)")
     parser.add_argument("--early-stopping-rounds", type=int, default=100)
+    parser.add_argument("--staging-bucket", required=False, help="gs://<bucket> to use for AI Platform staging")
     args = parser.parse_args()
 
-    aiplatform.init(project=args.project_id, location=args.region)
+    # Init Vertex AI with an explicit staging bucket (required by CustomJob)
+    aiplatform.init(
+        project=args.project_id,
+        location=args.region,
+        staging_bucket=(args.staging_bucket or f"gs://{args.project_id}-staging"),
+    )
 
     # Trial job spec (CustomJob)
     worker_pool_specs = [{

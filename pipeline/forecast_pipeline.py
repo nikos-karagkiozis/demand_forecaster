@@ -123,7 +123,7 @@ def hpt_submit_op(
     from google.cloud import aiplatform
     from google.cloud.aiplatform import hyperparameter_tuning as hpt
 
-    aiplatform.init(project=project_id, location=region)
+    aiplatform.init(project=project_id, location=region, staging_bucket=f"gs://{project_id}-staging")
 
     # Worker pool spec mirrors the training step
     worker_pool_specs = [{

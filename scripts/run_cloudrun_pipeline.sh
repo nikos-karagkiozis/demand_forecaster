@@ -117,6 +117,7 @@ if [[ "${ENABLE_HPT,,}" == "true" || "${ENABLE_HPT}" == "1" || "${ENABLE_HPT,,}"
 --region,${REGION},\
 --image-uri,${DOCKER_IMAGE_URI},\
 --service-account,${SERVICE_ACCOUNT},\
+--staging-bucket,gs://${STAGING_BUCKET},\
 --display-name,sf-hpt,\
 --metric-name,${HPT_METRIC_NAME},\
 --metric-goal,${HPT_METRIC_GOAL},\
@@ -133,6 +134,7 @@ if [[ "${ENABLE_HPT,,}" == "true" || "${ENABLE_HPT}" == "1" || "${ENABLE_HPT,,}"
 --region,${REGION},\
 --image-uri,${DOCKER_IMAGE_URI},\
 --service-account,${SERVICE_ACCOUNT},\
+--staging-bucket,gs://${STAGING_BUCKET},\
 --display-name,sf-hpt,\
 --metric-name,${HPT_METRIC_NAME},\
 --metric-goal,${HPT_METRIC_GOAL},\
@@ -148,6 +150,7 @@ if [[ "${ENABLE_HPT,,}" == "true" || "${ENABLE_HPT}" == "1" || "${ENABLE_HPT,,}"
 --region,${REGION},\
 --image-uri,${DOCKER_IMAGE_URI},\
 --service-account,${SERVICE_ACCOUNT},\
+--staging-bucket,gs://${STAGING_BUCKET},\
 --display-name,sf-hpt,\
 --metric-name,${HPT_METRIC_NAME},\
 --metric-goal,${HPT_METRIC_GOAL},\
