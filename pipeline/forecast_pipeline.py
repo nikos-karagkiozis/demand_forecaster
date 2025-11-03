@@ -64,16 +64,26 @@ def train_op(model_artifact: dsl.OutputPath(dsl.Model), hparams_json: str = ""):
     """Pipeline component to run the model training script and output the trained model."""
     import subprocess
     import json
+    import os
+    
     # KFP automatically provides a path for output artifacts
     args = ["python", "-m", "sales_forecast.train", "--model-path", model_artifact]
     if hparams_json:
+        hp = None
         try:
-            hp = json.loads(hparams_json)
+            # If we were given a file path (from another component), load it
+            if os.path.exists(hparams_json):
+                with open(hparams_json, "r", encoding="utf-8") as f:
+                    hp = json.load(f)
+            else:
+                # Otherwise, try to parse as inline JSON string
+                hp = json.loads(hparams_json)
+        except Exception:
+            hp = None
+        if isinstance(hp, dict):
             for k, v in hp.items():
                 flag = f"--{k.replace('_', '-')}"
                 args.extend([flag, str(v)])
-        except Exception:
-            pass
     subprocess.run(args, check=True)
 
 
@@ -134,7 +144,6 @@ def hpt_submit_op(
     custom_job = aiplatform.CustomJob(
         display_name="sales-forecast-hpt-trial",
         worker_pool_specs=worker_pool_specs,
-        service_account=service_account,
     )
 
     # Default param space if none provided
@@ -179,7 +188,7 @@ def hpt_submit_op(
         max_trial_count=int(max_trials),
         parallel_trial_count=int(parallel_trials),
     )
-    hp_job.run(sync=True)
+    hp_job.run(service_account=service_account, sync=True)
 
     # Extract best params
     goal_minimize = metric_goal == "minimize"
@@ -202,6 +211,10 @@ def hpt_submit_op(
 
     with open(best_params_json, "w", encoding="utf-8") as f:
         f.write(json.dumps(best_params))
+@dsl.component(
+    base_image=DOCKER_IMAGE_URI,
+    packages_to_install=[]
+)
 def register_and_deploy_op(
     model_artifact: dsl.Input[dsl.Model],
     project_id: str,

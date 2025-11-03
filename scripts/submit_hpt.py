@@ -138,7 +138,6 @@ def main() -> None:
     custom_job = aiplatform.CustomJob(
         display_name=f"{args.display_name}-trial",
         worker_pool_specs=worker_pool_specs,
-        service_account=args.service_account,
     )
 
     space = _load_param_space(args.param_space_json, args.param_space_gcs)
@@ -154,7 +153,7 @@ def main() -> None:
         parallel_trial_count=args.parallel_trials,
     )
 
-    hp_job.run(sync=True)
+    hp_job.run(service_account=args.service_account, sync=True)
 
     # Find best trial
     goal_minimize = args.metric_goal == "minimize"
