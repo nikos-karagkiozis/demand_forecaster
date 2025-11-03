@@ -16,7 +16,6 @@ import pandas as pd
 import lightgbm as lgb
 import joblib
 import argparse # Added import for argparse
-import numpy as np
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, root_mean_squared_error
 from google.cloud import bigquery
 from google.cloud import storage
@@ -123,52 +122,16 @@ def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified t
     client = bigquery.Client(project=config.bq.PROJECT_ID)
     table_ref = f"{config.bq.PROJECT_ID}.{config.bq.DATASET}.{config.bq.FINAL_TABLE}"
     raw_df = load_data_from_bq(client, table_ref)
-    raw_rows, raw_cols = raw_df.shape
-    logging.info(f"[Diagnostics] Raw dataset: rows={raw_rows}, cols={raw_cols}")
 
     # 2. Feature Engineering
     logging.info("Generating features...")
     featured_df = generate_features(raw_df)
-    feat_rows, feat_cols = featured_df.shape
-    # Expected warmup drop is approximately the max of configured lags/windows
-    try:
-        warmup = max(max(config.features.LAGS), max(config.features.WINDOWS))
-    except Exception:
-        warmup = 0
-    dropped_rows = raw_rows - feat_rows
-    logging.info(f"[Diagnostics] After feature generation: rows={feat_rows}, cols={feat_cols}")
-    logging.info(f"[Diagnostics] Rows dropped by feature gen: {dropped_rows} (expected warmup≈{warmup})")
-    if dropped_rows > max(1, warmup) * 2:
-        logging.warning("[Diagnostics] Dropped rows >> expected warmup. Upstream missingness likely.")
 
     # 3. Data Splitting
     train_df, val_df = split_data_by_time(featured_df, test_size=0.2)
-    logging.info(f"[Diagnostics] Split sizes → train={len(train_df)}, val={len(val_df)}")
 
     X_train, y_train = prepare_dataset_for_modeling(train_df, config.features.TARGET_COL)
     X_val, y_val = prepare_dataset_for_modeling(val_df, config.features.TARGET_COL)
-    logging.info(f"[Diagnostics] X shapes → train={X_train.shape}, val={X_val.shape}")
-    try:
-        y_train_var = float(np.var(y_train))
-        y_val_var = float(np.var(y_val))
-        logging.info(f"[Diagnostics] y variance → train={y_train_var:.4f}, val={y_val_var:.4f}")
-    except Exception as e:
-        logging.warning(f"[Diagnostics] Could not compute y variance: {e}")
-
-    # Feature non-null ratios (post-feature-gen, pre-training)
-    try:
-        non_null_ratio = X_train.notnull().mean()
-        mean_nnr = float(non_null_ratio.mean())
-        min_nnr = float(non_null_ratio.min())
-        cnt_lt1 = int((non_null_ratio < 1.0).sum())
-        logging.info(f"[Diagnostics] Features={X_train.shape[1]} | non-null ratio mean={mean_nnr:.3f}, min={min_nnr:.3f}, features_with_nulls={cnt_lt1}")
-        # Persist a small sample for quick inspection
-        os.makedirs("/tmp", exist_ok=True)
-        nnr_path = "/tmp/feature_non_null_ratio.csv"
-        non_null_ratio.sort_values().head(20).to_csv(nnr_path, header=['non_null_ratio'])
-        logging.info(f"[Diagnostics] Wrote non-null ratio sample to {nnr_path}")
-    except Exception as e:
-        logging.warning(f"[Diagnostics] Could not compute/write feature non-null ratios: {e}")
 
     # 4. Model Training
     logging.info("Training LightGBM model...")
@@ -191,12 +154,6 @@ def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified t
               eval_set=[(X_val, y_val)],
               eval_metric='mae',
               callbacks=[lgb.early_stopping(100, verbose=True)])
-    # Post-training diagnostics
-    try:
-        best_iter = getattr(model, "best_iteration_", None)
-        logging.info(f"[Diagnostics] best_iteration_: {best_iter}")
-    except Exception:
-        pass
 
     # 5. Model Evaluation
     logging.info("Evaluating model performance...")
@@ -262,12 +219,6 @@ def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified t
         try:
             importances = getattr(model, "feature_importances_", None)
             if importances is not None:
-                try:
-                    zero_imp = int((np.array(importances) == 0).sum())
-                    mean_imp = float(np.mean(importances))
-                    logging.info(f"[Diagnostics] Importances → zero={zero_imp}/{len(importances)}, mean={mean_imp:.6f}")
-                except Exception:
-                    pass
                 fi = pd.DataFrame({
                     "feature": X_train.columns,
                     "importance": importances
@@ -305,15 +256,11 @@ def main(model_output_path: str, model_gcs_uri: str | None = None): # Modified t
             target_gcs_dir = _derive_artifact_dir_from_model_gcs_uri(os.environ["MODEL_GCS_URI"])
 
         if target_gcs_dir:
-            # Also upload the non-null ratio sample CSV if present
-            extra_diag_path = "/tmp/feature_non_null_ratio.csv"
-            upload_list = [val_plot_path, scatter_path, resid_path, fi_path, extra_diag_path]
-            for local_path in upload_list:
+            for local_path in [val_plot_path, scatter_path, resid_path, fi_path]:
                 if os.path.exists(local_path):
-                    subdir = "diagnostics" if local_path.endswith(".csv") else "plots"
-                    gcs_uri = target_gcs_dir.rstrip("/") + f"/{subdir}/" + os.path.basename(local_path)
+                    gcs_uri = target_gcs_dir.rstrip("/") + "/plots/" + os.path.basename(local_path)
                     upload_file_to_gcs(local_path, gcs_uri)
-                    logging.info(f"Uploaded artifact to {gcs_uri}")
+                    logging.info(f"Uploaded plot to {gcs_uri}")
     except Exception as e:
         logging.warning(f"Plot generation/upload skipped due to error: {e}")
 
