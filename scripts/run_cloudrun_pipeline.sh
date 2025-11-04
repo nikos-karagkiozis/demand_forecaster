@@ -26,6 +26,7 @@ HPT_MACHINE_TYPE="${HPT_MACHINE_TYPE:-n1-standard-4}"
 BEST_PARAMS_URI="${BEST_PARAMS_URI:-gs://${PROJECT_ID}-staging/hpt/best_params.json}"
 HPT_PARAM_SPACE_GCS="${HPT_PARAM_SPACE_GCS:-}"
 HPT_PARAM_SPACE_JSON="${HPT_PARAM_SPACE_JSON:-}"
+HPT_TRIAL_SERVICE_ACCOUNT="${HPT_TRIAL_SERVICE_ACCOUNT:-}"
 
 # Model artifact location in GCS for cross-step sharing
 MODEL_GCS_URI="${MODEL_GCS_URI:-gs://${PROJECT_ID}-staging/models/model.joblib}"
@@ -114,15 +115,11 @@ if [[ "${ENABLE_HPT,,}" == "true" || "${ENABLE_HPT}" == "1" || "${ENABLE_HPT,,}"
     fi
   fi
 
-  cr_job_upsert "sf-hpt" \
-    --service-account "${SERVICE_ACCOUNT}" \
-    --set-env-vars "${COMMON_ENVS}" \
-    --command python \
-    --args="scripts/submit_hpt.py,\
+  # Build base args for HPT submitter
+  HPT_ARGS="scripts/submit_hpt.py,\
 --project-id,${PROJECT_ID},\
 --region,${REGION},\
 --image-uri,${DOCKER_IMAGE_URI},\
---service-account,${SERVICE_ACCOUNT},\
 --staging-bucket,gs://${STAGING_BUCKET},\
 --display-name,sf-hpt,\
 --metric-name,${HPT_METRIC_NAME},\
@@ -131,40 +128,23 @@ if [[ "${ENABLE_HPT,,}" == "true" || "${ENABLE_HPT}" == "1" || "${ENABLE_HPT,,}"
 --parallel-trials,${HPT_PARALLEL_TRIALS},\
 --machine-type,${HPT_MACHINE_TYPE},\
 --best-params-output-gcs,${BEST_PARAMS_URI}"
+  if [[ -n "${HPT_TRIAL_SERVICE_ACCOUNT}" ]]; then
+    HPT_ARGS="${HPT_ARGS},--service-account,${HPT_TRIAL_SERVICE_ACCOUNT}"
+  fi
+
+  cr_job_upsert "sf-hpt" \
+    --service-account "${SERVICE_ACCOUNT}" \
+    --set-env-vars "${COMMON_ENVS}" \
+    --command python \
+    --args="${HPT_ARGS}"
 
   # Append optional param space flags if provided
   if [[ -n "${HPT_PARAM_SPACE_GCS}" ]]; then
     gcloud run jobs update "sf-hpt" --region "${REGION}" \
-      --args="scripts/submit_hpt.py,\
---project-id,${PROJECT_ID},\
---region,${REGION},\
---image-uri,${DOCKER_IMAGE_URI},\
---service-account,${SERVICE_ACCOUNT},\
---staging-bucket,gs://${STAGING_BUCKET},\
---display-name,sf-hpt,\
---metric-name,${HPT_METRIC_NAME},\
---metric-goal,${HPT_METRIC_GOAL},\
---max-trials,${HPT_MAX_TRIALS},\
---parallel-trials,${HPT_PARALLEL_TRIALS},\
---machine-type,${HPT_MACHINE_TYPE},\
---best-params-output-gcs,${BEST_PARAMS_URI},\
---param-space-gcs,${HPT_PARAM_SPACE_GCS}" >/dev/null
+      --args="${HPT_ARGS},--param-space-gcs,${HPT_PARAM_SPACE_GCS}" >/dev/null
   elif [[ -n "${HPT_PARAM_SPACE_JSON}" ]]; then
     gcloud run jobs update "sf-hpt" --region "${REGION}" \
-      --args="scripts/submit_hpt.py,\
---project-id,${PROJECT_ID},\
---region,${REGION},\
---image-uri,${DOCKER_IMAGE_URI},\
---service-account,${SERVICE_ACCOUNT},\
---staging-bucket,gs://${STAGING_BUCKET},\
---display-name,sf-hpt,\
---metric-name,${HPT_METRIC_NAME},\
---metric-goal,${HPT_METRIC_GOAL},\
---max-trials,${HPT_MAX_TRIALS},\
---parallel-trials,${HPT_PARALLEL_TRIALS},\
---machine-type,${HPT_MACHINE_TYPE},\
---best-params-output-gcs,${BEST_PARAMS_URI},\
---param-space-json,${HPT_PARAM_SPACE_JSON}" >/dev/null
+      --args="${HPT_ARGS},--param-space-json,${HPT_PARAM_SPACE_JSON}" >/dev/null
   fi
 
   cr_job_upsert "sf-train-best" \
