@@ -42,6 +42,8 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 # Copy the application source code
 COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY deploy/ ./deploy/
 
 # Set the PYTHONPATH to ensure the 'sales_forecast' module is importable
 ENV PYTHONPATH="/app/src:/app"
