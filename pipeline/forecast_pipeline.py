@@ -188,7 +188,15 @@ def hpt_submit_op(
         max_trial_count=int(max_trials),
         parallel_trial_count=int(parallel_trials),
     )
-    hp_job.run(service_account=service_account, sync=True)
+    try:
+        if service_account:
+            hp_job.run(service_account=service_account, sync=True)
+        else:
+            hp_job.run(sync=True)
+    except Exception as e:
+        # Try again without service account to avoid IAM/actAs issues; use Vertex default
+        print(f"[WARN] HPT run with service_account failed: {e}. Retrying without service_account...")
+        hp_job.run(sync=True)
 
     # Extract best params
     goal_minimize = metric_goal == "minimize"

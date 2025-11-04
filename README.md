@@ -11,6 +11,7 @@ This repository implements an end-to-end forecasting use case on Google Cloud us
 - **Predictions**: Online (Endpoint) and Batch Prediction jobs.
 - **Monitoring**: Vertex AI Model Deployment Monitoring job (tabular drift).
 - **Reproducibility**: Poetry + Docker multi-stage builds; Cloud Build CI optional.
+ - **Hyperparameter tuning**: Vertex AI Bayesian HPT (UI or programmatic), with training code accepting trial params and reporting metrics.
 
 ### Architecture
 - **BigQuery**: Final features table `daily_sales_features` consumed by training and inference.
@@ -165,6 +166,66 @@ Or use the helper script (builds/pushes image, compiles, submits):
 ```
 
 
+## Hyperparameter Tuning (Vertex AI)
+- Code (trainer): `src/sales_forecast/train.py` accepts LightGBM params via CLI and reports an objective metric (via `hypertune`, with JSON fallback).
+- Programmatic HPT submitter: `scripts/submit_hpt.py` – creates a Vertex `HyperparameterTuningJob` backed by your training image and writes best params to GCS.
+- Train with best: `scripts/train_with_best_params.py` – reads the best params JSON and re-trains once to produce a single artifact.
+
+Two ways to run HPT:
+
+1) Standalone (no UI)
+```bash
+# Submit HPT
+python scripts/submit_hpt.py \
+  --project-id "${PROJECT_ID}" \
+  --region "${REGION}" \
+  --image-uri "${DOCKER_IMAGE_URI}" \
+  --service-account "${SERVICE_ACCOUNT}" \
+  --staging-bucket "gs://${PROJECT_ID}-staging" \
+  --display-name sf-hpt \
+  --metric-name mae --metric-goal minimize \
+  --max-trials 20 --parallel-trials 4 \
+  --machine-type n1-standard-4 \
+  --best-params-output-gcs "gs://${PROJECT_ID}-staging/hpt/best_params.json"
+
+# Re-train with best parameters (single artifact to promote)
+python scripts/train_with_best_params.py \
+  --best-params-gcs-uri "gs://${PROJECT_ID}-staging/hpt/best_params.json" \
+  --model-path /tmp/model.joblib \
+  --model-gcs-uri "${MODEL_GCS_URI}"
+```
+
+Optionally provide a parameter space file:
+```json
+{
+  "learning_rate": {"type": "double", "min": 0.001, "max": 0.3, "scale": "log"},
+  "num_leaves": {"type": "integer", "min": 16, "max": 512},
+  "feature_fraction": {"type": "double", "min": 0.5, "max": 1.0},
+  "bagging_fraction": {"type": "double", "min": 0.5, "max": 1.0},
+  "bagging_freq": {"type": "integer", "min": 0, "max": 10},
+  "lambda_l1": {"type": "double", "min": 1e-8, "max": 10.0, "scale": "log"},
+  "lambda_l2": {"type": "double", "min": 1e-8, "max": 10.0, "scale": "log"},
+  "min_child_samples": {"type": "integer", "min": 5, "max": 200},
+  "max_depth": {"type": "integer", "min": -1, "max": 16}
+}
+```
+Save it to `gs://${PROJECT_ID}-staging/hpt/param_space.json` and pass `--param-space-gcs` to `submit_hpt.py`.
+
+2) Inside the pipeline (KFP)
+- Set `ENABLE_HPT_IN_PIPELINE=true` before compiling/submitting the pipeline. The pipeline will:
+  - Run `hpt_submit_op` to create and wait for a Vertex HPT job.
+  - Pass the best params JSON to `train_op`, which forwards them as CLI flags to the trainer.
+- Optional overrides (env): `HPT_METRIC_NAME`, `HPT_METRIC_GOAL`, `HPT_MAX_TRIALS`, `HPT_PARALLEL_TRIALS`, `HPT_MACHINE_TYPE`, `HPT_PARAM_SPACE_JSON`.
+
+3) With Cloud Run Jobs
+- Set `ENABLE_HPT=true` and run `./scripts/run_cloudrun_pipeline.sh`.
+- Flow: data_ingest → submit HPT → train with best → predict.
+- Optional overrides (env): `HPT_*`, `BEST_PARAMS_URI`, `HPT_PARAM_SPACE_GCS` or `HPT_PARAM_SPACE_JSON`.
+
+Notes:
+- The training image must include `scripts/` and `deploy/` (the Dockerfile already copies them).
+- Vertex `CustomJob` requires a staging bucket; scripts use `gs://${PROJECT_ID}-staging` by default and ensure it exists.
+
 ### Pipeline artifacts vs model artifacts (PIPELINE_ROOT vs models directory)
 
 - **PIPELINE_ROOT** is a GCS prefix where Vertex/KFP stores run-time execution data: component outputs (artifacts), logs, and metadata for each pipeline run.
@@ -304,6 +365,17 @@ Common variables (can be set in `.env` and read by scripts/components):
 - **MODEL_GCS_URI**: optional central model artifact URI
 - **ENABLE_DEPLOY**: set to `true` to let the pipeline register+deploy using `SERVING_IMAGE_URI` (default `false`).
 
+Hyperparameter tuning (Cloud Run and/or Pipelines):
+- **ENABLE_HPT**: `true|false` (Cloud Run) – submit HPT and then train with best params.
+- **ENABLE_HPT_IN_PIPELINE**: `true|false` – run HPT inside pipeline and pass best params to training.
+- **HPT_MAX_TRIALS**, **HPT_PARALLEL_TRIALS**
+- **HPT_METRIC_NAME**: `mae` (default), `rmse`, or `r2` (must match what trainer reports).
+- **HPT_METRIC_GOAL**: `minimize|maximize` (defaults to `minimize`).
+- **HPT_MACHINE_TYPE**: e.g., `n1-standard-4`.
+- **BEST_PARAMS_URI**: `gs://.../best_params.json` (Cloud Run path).
+- **HPT_PARAM_SPACE_GCS**: `gs://.../param_space.json` (preferred) or **HPT_PARAM_SPACE_JSON**: inline JSON string.
+- **STAGING_BUCKET**: `my-project-staging` (used by Vertex jobs; defaults to `<PROJECT_ID>-staging`).
+
 Scripts auto-load `.env` if present.
 
 
@@ -362,6 +434,8 @@ rm -f forecast_pipeline.json .vertex_endpoint_id || true
     endpoint_predict.py
     batch_predict.py
     setup_model_monitoring.py
+    submit_hpt.py
+    train_with_best_params.py
   src/
     sales_forecast/
       __init__.py

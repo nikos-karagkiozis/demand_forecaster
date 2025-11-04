@@ -67,6 +67,15 @@ What happens when you run `./scripts/deploy_and_run.sh`:
        - Builds in-memory features (temporal, lag, rolling, one-hot) and splits by time.
        - Trains a LightGBM model, evaluates, and saves `model.joblib` to the component’s output path (Vertex mirrors it under your Pipeline Root bucket in GCS).
        - After completion: a model artifact is available as a pipeline output.
+   - Optional: `hpt_submit_op(...)` (Vertex HPT inside the pipeline)
+     - Trigger condition: set `ENABLE_HPT_IN_PIPELINE=true` (and ensure your image is built/pushed).
+     - What it does:
+       - Creates a Vertex `HyperparameterTuningJob` that launches many trials of your training container (Bayesian optimization by default).
+       - Each trial passes different CLI params to `sales_forecast.train`, which reports the objective metric via `hypertune` (or JSON fallback).
+       - On completion, selects the best trial and returns its parameter dict as JSON.
+     - Parameters:
+       - Override with env: `HPT_METRIC_NAME`, `HPT_METRIC_GOAL`, `HPT_MAX_TRIALS`, `HPT_PARALLEL_TRIALS`, `HPT_MACHINE_TYPE`, `HPT_PARAM_SPACE_JSON`.
+     - Flow: `data_ingest_op` → `hpt_submit_op` → `train_op(hparams_json=best_params)` → `predict_op`.
    - `predict_op(model_artifact)`:
      - Code invoked: `src/sales_forecast/predict.py`
      - Services used: BigQuery
@@ -116,6 +125,9 @@ Notes and outcomes:
 - After the pipeline run, your final BigQuery table exists; a trained model artifact exists in GCS (pipeline root and/or the models directory); optionally (if enabled), a Vertex AI Endpoint exists and serves predictions.
 - To call the live endpoint later, use `scripts/endpoint_predict.py` or the demo notebook.
 
+Staging bucket requirement:
+- Vertex custom training/HPT needs a staging bucket. The pipeline HPT component initializes Vertex with `staging_bucket=gs://<PROJECT_ID>-staging` (created by the scripts if missing).
+
 ---
 
 ## B) Cloud Run Jobs orchestration (no-Vertex-Pipelines path)
@@ -135,6 +147,14 @@ What happens when you run it:
      - `sf-data-ingest`: runs `python -m sales_forecast.data_ingest`
      - `sf-train`: runs `python -m sales_forecast.train --model-path /tmp/model.joblib --model-gcs-uri ${MODEL_GCS_URI}`
      - `sf-predict`: runs `python -m sales_forecast.predict --model-gcs-uri ${MODEL_GCS_URI}`
+
+Optional HPT (programmatic) with Cloud Run
+- Trigger: set `ENABLE_HPT=true` before running `./scripts/run_cloudrun_pipeline.sh`.
+- What it adds:
+  - Job `sf-hpt`: runs `python scripts/submit_hpt.py` to create a Vertex `HyperparameterTuningJob`, wait for completion, and write the best params to `BEST_PARAMS_URI` (GCS JSON).
+  - Job `sf-train-best`: runs `python scripts/train_with_best_params.py` to re-train with the best parameters and upload the single final artifact to `MODEL_GCS_URI`.
+- Parameters (env): `HPT_MAX_TRIALS`, `HPT_PARALLEL_TRIALS`, `HPT_METRIC_NAME`, `HPT_METRIC_GOAL`, `HPT_MACHINE_TYPE`, `BEST_PARAMS_URI`, `HPT_PARAM_SPACE_GCS` or `HPT_PARAM_SPACE_JSON`.
+- The script ensures `gs://<PROJECT_ID>-staging` exists and passes it to Vertex as the staging bucket.
 
 3) Execute jobs sequentially and wait for completion
    - `sf-data-ingest`:
@@ -207,6 +227,8 @@ Notes and outcomes:
 - `scripts/endpoint_predict.py`: simple client to call a Vertex AI Endpoint for online predictions.
 - `scripts/batch_predict.py`: creates a Vertex AI Batch Prediction job (input/output can be GCS or BigQuery).
 - `scripts/setup_model_monitoring.py`: creates a Vertex AI Model Deployment Monitoring job (feature drift monitoring).
+ - `scripts/submit_hpt.py`: programmatically submits a Vertex `HyperparameterTuningJob` and writes best params JSON to GCS.
+ - `scripts/train_with_best_params.py`: reads best params JSON and runs training once with those params to produce a single model artifact.
 
 ---
 

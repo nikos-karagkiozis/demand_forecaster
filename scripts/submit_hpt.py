@@ -40,6 +40,7 @@ from typing import Any, Dict
 from google.cloud import aiplatform
 from google.cloud.aiplatform import hyperparameter_tuning as hpt
 from google.cloud import storage
+from google.api_core import exceptions as gcore_exceptions
 
 
 def _load_param_space(inline_json: str | None, gcs_uri: str | None) -> Dict[str, Any]:
@@ -159,7 +160,15 @@ def main() -> None:
         parallel_trial_count=args.parallel_trials,
     )
 
-    hp_job.run(service_account=args.service_account, sync=True)
+    try:
+        if args.service_account:
+            hp_job.run(service_account=args.service_account, sync=True)
+        else:
+            hp_job.run(sync=True)
+    except (gcore_exceptions.InvalidArgument, gcore_exceptions.PermissionDenied) as e:
+        # Fallback: try without specifying a service account. This uses Vertex default runtime SA.
+        print(f"[WARN] HPT run with service_account failed: {e}. Retrying without service_account...")
+        hp_job.run(sync=True)
 
     # Find best trial
     goal_minimize = args.metric_goal == "minimize"
