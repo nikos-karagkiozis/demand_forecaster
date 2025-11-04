@@ -18,6 +18,8 @@ import lightgbm as lgb
 import joblib
 import argparse # Added import for argparse
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, root_mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
+import numpy as np
 from google.cloud import bigquery
 from google.cloud import storage
 import logging
@@ -181,11 +183,77 @@ def main(
         'seed': 42,
         'boosting_type': 'gbdt',
     }
+    # --- Optional: Time-series cross-validation over the training window ---
+    # We support CV via CLI flags. When enabled, we select a robust number of trees
+    # (n_estimators) based on per-fold best_iteration_, then proceed to train the
+    # final model on the full training window and evaluate on the held-out val set.
+    cv_folds = int(os.environ.get("CV_FOLDS", "0"))
+    cv_gap = int(os.environ.get("CV_GAP", "0"))
+    # cv_val_window can also be provided; if not, we derive a reasonable default
+    cv_val_window_env = os.environ.get("CV_VAL_WINDOW")
+    cv_val_window: int | None = int(cv_val_window_env) if cv_val_window_env else None
+
+    # If CV flags are not set via env, check if we were invoked via CLI (args parsed later)
+    # We'll allow CLI to override after argparse processing at the bottom.
+    # For now, placeholders that may be overwritten.
+    cli_cv_overrides: dict[str, int | None] = {}
     # Apply externally provided hyperparameters (e.g., from Vertex HPT trials)
     if hparams:
         for k, v in hparams.items():
             if v is not None:
                 lgbm_params[k] = v
+
+    # Perform time-series CV on the training window if requested
+    if cv_folds and cv_folds > 1:
+        # Allow CLI overrides (wired after argparse). If present, apply now.
+        cv_folds = int(cli_cv_overrides.get("cv_folds", cv_folds) or cv_folds)
+        cv_gap = int(cli_cv_overrides.get("cv_gap", cv_gap) or cv_gap)
+        cv_val_window = int(cli_cv_overrides.get("cv_val_window", cv_val_window) or (cv_val_window if cv_val_window is not None else 0)) or None
+
+        # Derive a default validation window if not provided
+        if cv_val_window is None:
+            # Heuristic: at least 7 rows, around 10% of training size, capped at 28
+            cv_val_window = max(7, min(28, max(1, int(len(X_train) * 0.1))))
+
+        if len(X_train) <= cv_val_window * cv_folds:
+            logging.warning(
+                f"Insufficient rows for requested CV (rows={len(X_train)}, cv_folds={cv_folds}, cv_val_window={cv_val_window}). "
+                f"Disabling CV and proceeding with single hold-out."
+            )
+        else:
+            logging.info(
+                f"Running time-series CV: folds={cv_folds}, val_window={cv_val_window}, gap={cv_gap}"
+            )
+            tscv = TimeSeriesSplit(n_splits=cv_folds, test_size=cv_val_window, gap=cv_gap)
+            fold_rmses: list[float] = []
+            fold_best_iters: list[int] = []
+            early_stopping_rounds = int(os.environ.get('EARLY_STOPPING_ROUNDS', '100'))
+            for i, (tr_idx, va_idx) in enumerate(tscv.split(X_train), start=1):
+                X_tr, y_tr = X_train.iloc[tr_idx], y_train.iloc[tr_idx]
+                X_va, y_va = X_train.iloc[va_idx], y_train.iloc[va_idx]
+                fold_model = lgb.LGBMRegressor(**lgbm_params)
+                fold_model.fit(
+                    X_tr, y_tr,
+                    eval_set=[(X_va, y_va)],
+                    eval_metric=lgbm_params.get('metric', 'rmse'),
+                    callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False)]
+                )
+                va_pred = fold_model.predict(X_va)
+                rmse_fold = root_mean_squared_error(y_va, va_pred)
+                best_iter = getattr(fold_model, "best_iteration_", None) or lgbm_params.get('n_estimators', 1000)
+                fold_rmses.append(float(rmse_fold))
+                fold_best_iters.append(int(best_iter))
+                logging.info(f"CV fold {i}/{cv_folds}: RMSE={rmse_fold:.4f}, best_iteration={best_iter}")
+
+            cv_rmse_mean = float(np.mean(fold_rmses))
+            cv_rmse_std = float(np.std(fold_rmses))
+            chosen_n_estimators = int(np.median(fold_best_iters))
+            logging.info(
+                f"CV summary: mean RMSE={cv_rmse_mean:.4f} (±{cv_rmse_std:.4f}), "
+                f"best_iteration median={chosen_n_estimators}"
+            )
+            # Use a robust central tendency for final n_estimators
+            lgbm_params['n_estimators'] = max(10, chosen_n_estimators)
 
     model = lgb.LGBMRegressor(**lgbm_params)
     model.fit(X_train, y_train,
@@ -344,10 +412,25 @@ if __name__ == "__main__":
     # Vertex HPT metric name to report (e.g., mae, rmse, r2)
     parser.add_argument("--hpt-metric-name", dest="hpt_metric_name", type=str, required=False,
                         help="Objective metric name to report to Vertex HPT (e.g., mae, rmse, r2)")
+    # Time-series cross-validation controls (optional)
+    parser.add_argument("--cv-folds", dest="cv_folds", type=int, required=False,
+                        help="Number of time-series CV folds over the training window (0 or None disables).")
+    parser.add_argument("--cv-val-window", dest="cv_val_window", type=int, required=False,
+                        help="Validation window size (rows) per fold for time-series CV. Auto if not set.")
+    parser.add_argument("--cv-gap", dest="cv_gap", type=int, required=False,
+                        help="Gap (rows) between train and validation windows for time-series CV.")
     args = parser.parse_args()
     # If user provided early stopping rounds via CLI, set env so the callback picks it up
     if getattr(args, "early_stopping_rounds", None) is not None:
         os.environ["EARLY_STOPPING_ROUNDS"] = str(args.early_stopping_rounds)
+
+    # Wire CV overrides for the session if provided
+    if getattr(args, "cv_folds", None) is not None:
+        os.environ["CV_FOLDS"] = str(args.cv_folds)
+    if getattr(args, "cv_val_window", None) is not None:
+        os.environ["CV_VAL_WINDOW"] = str(args.cv_val_window)
+    if getattr(args, "cv_gap", None) is not None:
+        os.environ["CV_GAP"] = str(args.cv_gap)
 
     # Collect provided hparams only (None means use defaults)
     cli_hparams = {}
