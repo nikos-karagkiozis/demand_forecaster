@@ -59,6 +59,12 @@ if [[ "${MODEL_GCS_URI}" == gs://*/* ]]; then
   fi
 fi
 
+# Ensure the staging bucket exists (used by Vertex CustomJobs/HPT)
+STAGING_BUCKET="${STAGING_BUCKET:-${PROJECT_ID}-staging}"
+if ! gsutil ls -b "gs://${STAGING_BUCKET}" >/dev/null 2>&1; then
+  gsutil mb -l "${LOCATION}" "gs://${STAGING_BUCKET}"
+fi
+
 # Build & push image if not present
 gcloud auth configure-docker "${REGION}-docker.pkg.dev" -q
 docker build -t "${DOCKER_IMAGE_URI}" .
