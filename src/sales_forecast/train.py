@@ -144,6 +144,219 @@ def _report_hpt_metric(metric_name: str, value: float, step: int = 0) -> None:
             print(f"{metric_name}={float(value)}")
 
 
+def get_default_lgbm_params() -> dict:
+    """Return the default LightGBM parameter dictionary used for training."""
+    return {
+        'objective': 'regression_l2',
+        'metric': 'rmse',
+        'n_estimators': 1000,
+        'learning_rate': 0.5,
+        'feature_fraction': 0.8,
+        'bagging_fraction': 0.8,
+        'bagging_freq': 1,
+        'verbose': -1,
+        'n_jobs': -1,
+        'seed': 42,
+        'boosting_type': 'gbdt',
+    }
+
+
+def read_cv_settings_from_env() -> tuple[int, int, int | None]:
+    """Read time-series CV settings from environment variables.
+
+    Returns:
+        A tuple of (cv_folds, cv_gap, cv_val_window or None).
+    """
+    cv_folds = int(os.environ.get("CV_FOLDS", "0"))
+    cv_gap = int(os.environ.get("CV_GAP", "0"))
+    cv_val_window_env = os.environ.get("CV_VAL_WINDOW")
+    cv_val_window: int | None = int(cv_val_window_env) if cv_val_window_env else None
+    return cv_folds, cv_gap, cv_val_window
+
+
+def evaluate_time_series_cv(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    lgbm_params: dict,
+    cv_folds: int,
+    cv_val_window: int | None,
+    cv_gap: int,
+    early_stopping_rounds: int,
+) -> tuple[float, float, list[float], list[int]] | None:
+    """Run expanding-window time-series CV to assess stability.
+
+    Returns (mean_rmse, std_rmse, fold_rmses, fold_best_iters) or None if skipped.
+    """
+    if not (cv_folds and cv_folds > 1):
+        return None
+
+    if cv_val_window is None:
+        cv_val_window = max(7, min(28, max(1, int(len(X_train) * 0.1))))
+
+    if len(X_train) <= cv_val_window * cv_folds:
+        logging.warning(
+            f"Insufficient rows for requested CV (rows={len(X_train)}, cv_folds={cv_folds}, cv_val_window={cv_val_window}). "
+            f"Skipping CV."
+        )
+        return None
+
+    logging.info(f"Running time-series CV: folds={cv_folds}, val_window={cv_val_window}, gap={cv_gap}")
+    tscv = TimeSeriesSplit(n_splits=cv_folds, test_size=cv_val_window, gap=cv_gap)
+    fold_rmses: list[float] = []
+    fold_best_iters: list[int] = []
+
+    for i, (tr_idx, va_idx) in enumerate(tscv.split(X_train), start=1):
+        X_tr, y_tr = X_train.iloc[tr_idx], y_train.iloc[tr_idx]
+        X_va, y_va = X_train.iloc[va_idx], y_train.iloc[va_idx]
+        fold_model = lgb.LGBMRegressor(**lgbm_params)
+        fold_model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_va, y_va)],
+            eval_metric=lgbm_params.get('metric', 'rmse'),
+            callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False)]
+        )
+        va_pred = fold_model.predict(X_va)
+        rmse_fold = root_mean_squared_error(y_va, va_pred)
+        best_iter = getattr(fold_model, "best_iteration_", None) or lgbm_params.get('n_estimators', 1000)
+        fold_rmses.append(float(rmse_fold))
+        fold_best_iters.append(int(best_iter))
+        logging.info(f"CV fold {i}/{cv_folds}: RMSE={rmse_fold:.4f}, best_iteration={best_iter}")
+
+    cv_rmse_mean = float(np.mean(fold_rmses))
+    cv_rmse_std = float(np.std(fold_rmses))
+    logging.info(
+        f"CV summary: mean RMSE={cv_rmse_mean:.4f} (±{cv_rmse_std:.4f}). "
+        f"Per-fold best_iteration: {fold_best_iters}"
+    )
+    return cv_rmse_mean, cv_rmse_std, fold_rmses, fold_best_iters
+
+
+def train_with_eval(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    lgbm_params: dict,
+    early_stopping_rounds: int,
+) -> lgb.LGBMRegressor:
+    """Train a LightGBM model with early stopping and return the fitted model."""
+    model = lgb.LGBMRegressor(**lgbm_params)
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        eval_metric=lgbm_params.get('metric', 'rmse'),
+        callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=True)]
+    )
+    return model
+
+
+def evaluate_predictions(y_true: pd.Series, y_pred: np.ndarray) -> tuple[float, float, float]:
+    """Compute RMSE, MAE, and R^2 for predictions."""
+    rmse = root_mean_squared_error(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    return float(rmse), float(mae), float(r2)
+
+
+def generate_and_upload_plots(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    y_val: pd.Series,
+    preds_val: np.ndarray,
+    model: lgb.LGBMRegressor,
+    model_gcs_uri: str | None,
+) -> None:
+    """Generate validation/train diagnostic plots and upload to GCS if configured."""
+    os.makedirs("/tmp/plots", exist_ok=True)
+
+    # Actual vs predicted (validation)
+    val_plot_path = "/tmp/plots/actual_vs_pred_val.png"
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(val_df["Date"], y_val.values, label="actual", linewidth=2)
+    ax.plot(val_df["Date"], preds_val, label="pred", linewidth=2)
+    ax.set_title("Validation: Actual vs Predicted")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(val_plot_path, dpi=150)
+    plt.close(fig)
+
+    # Predicted vs actual scatter (validation)
+    scatter_path = "/tmp/plots/pred_vs_actual_val.png"
+    fig, ax = plt.subplots(figsize=(6, 6))
+    sns.scatterplot(x=y_val.values, y=preds_val, ax=ax)
+    lims = [min(y_val.min(), preds_val.min()), max(y_val.max(), preds_val.max())]
+    ax.plot(lims, lims, "r--", linewidth=1)
+    ax.set_xlabel("Actual")
+    ax.set_ylabel("Predicted")
+    ax.set_title("Validation: Predicted vs Actual")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(scatter_path, dpi=150)
+    plt.close(fig)
+
+    # Residuals histogram (validation)
+    resid_path = "/tmp/plots/residuals_hist_val.png"
+    residuals = preds_val - y_val.values
+    fig, ax = plt.subplots(figsize=(8, 4))
+    sns.histplot(residuals, bins=30, kde=True, ax=ax)
+    ax.set_title("Validation Residuals Histogram")
+    ax.set_xlabel("Residual (pred - actual)")
+    fig.tight_layout()
+    fig.savefig(resid_path, dpi=150)
+    plt.close(fig)
+
+    # Feature importance
+    fi_path = "/tmp/plots/feature_importance.png"
+    try:
+        importances = getattr(model, "feature_importances_", None)
+        if importances is not None:
+            fi = pd.DataFrame({
+                "feature": X_train.columns,
+                "importance": importances
+            }).sort_values("importance", ascending=False).head(30)
+            fig, ax = plt.subplots(figsize=(10, max(4, len(fi) * 0.3)))
+            sns.barplot(data=fi, x="importance", y="feature", ax=ax, orient="h")
+            ax.set_title("Feature Importance (top 30)")
+            fig.tight_layout()
+            fig.savefig(fi_path, dpi=150)
+            plt.close(fig)
+    except Exception as e:
+        logging.warning(f"Skipping feature importance plot: {e}")
+
+    # Optional: training overlay (quick check)
+    try:
+        y_train_pred = model.predict(X_train)
+        train_plot_path = "/tmp/plots/actual_vs_pred_train.png"
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(train_df["Date"], y_train.values, label="actual", linewidth=1)
+        ax.plot(train_df["Date"], y_train_pred, label="pred", linewidth=1)
+        ax.set_title("Train: Actual vs Predicted")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(train_plot_path, dpi=150)
+        plt.close(fig)
+    except Exception as e:
+        logging.warning(f"Skipping training overlay plot: {e}")
+
+    # Upload plots to GCS alongside the model, if a target directory is known
+    target_gcs_dir = None
+    if model_gcs_uri:
+        target_gcs_dir = _derive_artifact_dir_from_model_gcs_uri(model_gcs_uri)
+    elif os.environ.get("MODEL_GCS_URI"):
+        target_gcs_dir = _derive_artifact_dir_from_model_gcs_uri(os.environ["MODEL_GCS_URI"])
+
+    if target_gcs_dir:
+        for local_path in [val_plot_path, scatter_path, resid_path, fi_path]:
+            if os.path.exists(local_path):
+                gcs_uri = target_gcs_dir.rstrip("/") + "/plots/" + os.path.basename(local_path)
+                upload_file_to_gcs(local_path, gcs_uri)
+                logging.info(f"Uploaded plot to {gcs_uri}")
+
+
 def main(
     model_output_path: str,
     model_gcs_uri: str | None = None,
@@ -170,103 +383,31 @@ def main(
 
     # 4. Model Training
     logging.info("Training LightGBM model...")
-    lgbm_params = {
-        'objective': 'regression_l2',
-        'metric': 'rmse',
-        'n_estimators': 1000,
-        'learning_rate': 0.61,
-        'feature_fraction': 0.8,
-        'bagging_fraction': 0.8,
-        'bagging_freq': 1,
-        'verbose': -1,
-        'n_jobs': -1,
-        'seed': 42,
-        'boosting_type': 'gbdt',
-    }
-    # --- Optional: Time-series cross-validation over the training window ---
-    # We support CV via CLI flags. When enabled, we select a robust number of trees
-    # (n_estimators) based on per-fold best_iteration_, then proceed to train the
-    # final model on the full training window and evaluate on the held-out val set.
-    cv_folds = int(os.environ.get("CV_FOLDS", "0"))
-    cv_gap = int(os.environ.get("CV_GAP", "0"))
-    # cv_val_window can also be provided; if not, we derive a reasonable default
-    cv_val_window_env = os.environ.get("CV_VAL_WINDOW")
-    cv_val_window: int | None = int(cv_val_window_env) if cv_val_window_env else None
-
-    # If CV flags are not set via env, check if we were invoked via CLI (args parsed later)
-    # We'll allow CLI to override after argparse processing at the bottom.
-    # For now, placeholders that may be overwritten.
-    cli_cv_overrides: dict[str, int | None] = {}
-    # Apply externally provided hyperparameters (e.g., from Vertex HPT trials)
+    lgbm_params = get_default_lgbm_params()
     if hparams:
         for k, v in hparams.items():
             if v is not None:
                 lgbm_params[k] = v
 
-    # Perform time-series CV on the training window if requested
-    if cv_folds and cv_folds > 1:
-        # Allow CLI overrides (wired after argparse). If present, apply now.
-        cv_folds = int(cli_cv_overrides.get("cv_folds", cv_folds) or cv_folds)
-        cv_gap = int(cli_cv_overrides.get("cv_gap", cv_gap) or cv_gap)
-        cv_val_window = int(cli_cv_overrides.get("cv_val_window", cv_val_window) or (cv_val_window if cv_val_window is not None else 0)) or None
+    early_stopping_rounds = int(os.environ.get('EARLY_STOPPING_ROUNDS', '100'))
+    cv_folds, cv_gap, cv_val_window = read_cv_settings_from_env()
+    cv_summary = evaluate_time_series_cv(
+        X_train, y_train, lgbm_params, cv_folds, cv_val_window, cv_gap, early_stopping_rounds
+    )
+    if cv_summary is not None:
+        mean_rmse, std_rmse, fold_rmses, fold_best_iters = cv_summary
+        logging.info(
+            "Time-series CV completed for stability assessment"
+        )
 
-        # Derive a default validation window if not provided
-        if cv_val_window is None:
-            # Heuristic: at least 7 rows, around 10% of training size, capped at 28
-            cv_val_window = max(7, min(28, max(1, int(len(X_train) * 0.1))))
-
-        if len(X_train) <= cv_val_window * cv_folds:
-            logging.warning(
-                f"Insufficient rows for requested CV (rows={len(X_train)}, cv_folds={cv_folds}, cv_val_window={cv_val_window}). "
-                f"Disabling CV and proceeding with single hold-out."
-            )
-        else:
-            logging.info(
-                f"Running time-series CV: folds={cv_folds}, val_window={cv_val_window}, gap={cv_gap}"
-            )
-            tscv = TimeSeriesSplit(n_splits=cv_folds, test_size=cv_val_window, gap=cv_gap)
-            fold_rmses: list[float] = []
-            fold_best_iters: list[int] = []
-            early_stopping_rounds = int(os.environ.get('EARLY_STOPPING_ROUNDS', '100'))
-            for i, (tr_idx, va_idx) in enumerate(tscv.split(X_train), start=1):
-                X_tr, y_tr = X_train.iloc[tr_idx], y_train.iloc[tr_idx]
-                X_va, y_va = X_train.iloc[va_idx], y_train.iloc[va_idx]
-                fold_model = lgb.LGBMRegressor(**lgbm_params)
-                fold_model.fit(
-                    X_tr, y_tr,
-                    eval_set=[(X_va, y_va)],
-                    eval_metric=lgbm_params.get('metric', 'rmse'),
-                    callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False)]
-                )
-                va_pred = fold_model.predict(X_va)
-                rmse_fold = root_mean_squared_error(y_va, va_pred)
-                best_iter = getattr(fold_model, "best_iteration_", None) or lgbm_params.get('n_estimators', 1000)
-                fold_rmses.append(float(rmse_fold))
-                fold_best_iters.append(int(best_iter))
-                logging.info(f"CV fold {i}/{cv_folds}: RMSE={rmse_fold:.4f}, best_iteration={best_iter}")
-
-            cv_rmse_mean = float(np.mean(fold_rmses))
-            cv_rmse_std = float(np.std(fold_rmses))
-            chosen_n_estimators = int(np.median(fold_best_iters))
-            logging.info(
-                f"CV summary: mean RMSE={cv_rmse_mean:.4f} (±{cv_rmse_std:.4f}), "
-                f"best_iteration median={chosen_n_estimators}"
-            )
-            # Use a robust central tendency for final n_estimators
-            lgbm_params['n_estimators'] = max(10, chosen_n_estimators)
-
-    model = lgb.LGBMRegressor(**lgbm_params)
-    model.fit(X_train, y_train,
-              eval_set=[(X_val, y_val)],
-              eval_metric=lgbm_params.get('metric', 'rmse'),
-              callbacks=[lgb.early_stopping(int(os.environ.get('EARLY_STOPPING_ROUNDS', '100')), verbose=True)])
+    model = train_with_eval(
+        X_train, y_train, X_val, y_val, lgbm_params, early_stopping_rounds
+    )
 
     # 5. Model Evaluation
     logging.info("Evaluating model performance...")
     preds = model.predict(X_val)
-    rmse = root_mean_squared_error(y_val, preds)
-    mae = mean_absolute_error(y_val, preds)
-    r2 = r2_score(y_val, preds)
+    rmse, mae, r2 = evaluate_predictions(y_val, preds)
 
     logging.info(f"Validation RMSE: {rmse:.4f}")
     logging.info(f"Validation MAE: {mae:.4f}")
@@ -295,92 +436,9 @@ def main(
 
     # 7. Generate and persist plots (validation + training quick checks)
     try:
-        os.makedirs("/tmp/plots", exist_ok=True)
-
-        # Actual vs predicted (validation)
-        val_plot_path = "/tmp/plots/actual_vs_pred_val.png"
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(val_df["Date"], y_val.values, label="actual", linewidth=2)
-        ax.plot(val_df["Date"], preds, label="pred", linewidth=2)
-        ax.set_title("Validation: Actual vs Predicted")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        fig.savefig(val_plot_path, dpi=150)
-        plt.close(fig)
-
-        # Predicted vs actual scatter (validation)
-        scatter_path = "/tmp/plots/pred_vs_actual_val.png"
-        fig, ax = plt.subplots(figsize=(6, 6))
-        sns.scatterplot(x=y_val.values, y=preds, ax=ax)
-        lims = [min(y_val.min(), preds.min()), max(y_val.max(), preds.max())]
-        ax.plot(lims, lims, "r--", linewidth=1)
-        ax.set_xlabel("Actual")
-        ax.set_ylabel("Predicted")
-        ax.set_title("Validation: Predicted vs Actual")
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        fig.savefig(scatter_path, dpi=150)
-        plt.close(fig)
-
-        # Residuals histogram (validation)
-        resid_path = "/tmp/plots/residuals_hist_val.png"
-        residuals = preds - y_val.values
-        fig, ax = plt.subplots(figsize=(8, 4))
-        sns.histplot(residuals, bins=30, kde=True, ax=ax)
-        ax.set_title("Validation Residuals Histogram")
-        ax.set_xlabel("Residual (pred - actual)")
-        fig.tight_layout()
-        fig.savefig(resid_path, dpi=150)
-        plt.close(fig)
-
-        # Feature importance
-        fi_path = "/tmp/plots/feature_importance.png"
-        try:
-            importances = getattr(model, "feature_importances_", None)
-            if importances is not None:
-                fi = pd.DataFrame({
-                    "feature": X_train.columns,
-                    "importance": importances
-                }).sort_values("importance", ascending=False).head(30)
-                fig, ax = plt.subplots(figsize=(10, max(4, len(fi) * 0.3)))
-                sns.barplot(data=fi, x="importance", y="feature", ax=ax, orient="h")
-                ax.set_title("Feature Importance (top 30)")
-                fig.tight_layout()
-                fig.savefig(fi_path, dpi=150)
-                plt.close(fig)
-        except Exception as e:
-            logging.warning(f"Skipping feature importance plot: {e}")
-
-        # Optional: training overlay (quick check)
-        try:
-            y_train_pred = model.predict(X_train)
-            train_plot_path = "/tmp/plots/actual_vs_pred_train.png"
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.plot(train_df["Date"], y_train.values, label="actual", linewidth=1)
-            ax.plot(train_df["Date"], y_train_pred, label="pred", linewidth=1)
-            ax.set_title("Train: Actual vs Predicted")
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            fig.tight_layout()
-            fig.savefig(train_plot_path, dpi=150)
-            plt.close(fig)
-        except Exception as e:
-            logging.warning(f"Skipping training overlay plot: {e}")
-
-        # Upload plots to GCS alongside the model, if a target directory is known
-        target_gcs_dir = None
-        if model_gcs_uri:
-            target_gcs_dir = _derive_artifact_dir_from_model_gcs_uri(model_gcs_uri)
-        elif os.environ.get("MODEL_GCS_URI"):
-            target_gcs_dir = _derive_artifact_dir_from_model_gcs_uri(os.environ["MODEL_GCS_URI"])
-
-        if target_gcs_dir:
-            for local_path in [val_plot_path, scatter_path, resid_path, fi_path]:
-                if os.path.exists(local_path):
-                    gcs_uri = target_gcs_dir.rstrip("/") + "/plots/" + os.path.basename(local_path)
-                    upload_file_to_gcs(local_path, gcs_uri)
-                    logging.info(f"Uploaded plot to {gcs_uri}")
+        generate_and_upload_plots(
+            train_df, val_df, X_train, y_train, y_val, preds, model, model_gcs_uri
+        )
     except Exception as e:
         logging.warning(f"Plot generation/upload skipped due to error: {e}")
 
