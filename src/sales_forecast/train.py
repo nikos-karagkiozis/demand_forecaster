@@ -169,8 +169,8 @@ def main(
     # 4. Model Training
     logging.info("Training LightGBM model...")
     lgbm_params = {
-        'objective': 'regression_l1',
-        'metric': 'mae',
+        'objective': 'regression_l2',
+        'metric': 'rmse',
         'n_estimators': 1000,
         'learning_rate': 0.05,
         'feature_fraction': 0.8,
@@ -190,7 +190,7 @@ def main(
     model = lgb.LGBMRegressor(**lgbm_params)
     model.fit(X_train, y_train,
               eval_set=[(X_val, y_val)],
-              eval_metric=lgbm_params.get('metric', 'mae'),
+              eval_metric=lgbm_params.get('metric', 'rmse'),
               callbacks=[lgb.early_stopping(int(os.environ.get('EARLY_STOPPING_ROUNDS', '100')), verbose=True)])
 
     # 5. Model Evaluation
