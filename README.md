@@ -6,6 +6,7 @@ This repository implements an end-to-end forecasting use case on Google Cloud us
 - **Data ingestion to BigQuery**: Safe staging → final table pattern from a CSV in GCS.
 - **Feature engineering**: Temporal, lag, and rolling features, plus one-hot categorical.
 - **Model training**: LightGBM regressor with evaluation and artifact export.
+- **Hyperparameter tuning (Vertex AI-ready)**: Training script exposes LightGBM params via CLI flags and reports an objective metric to Vertex AI Hyperparameter Tuning.
 - **Pipelines (KFP v2)**: Orchestrate ingest → train → predict; optional register & deploy.
 - **Custom serving**: FastAPI app packaged for Vertex AI Endpoints.
 - **Predictions**: Online (Endpoint) and Batch Prediction jobs.
@@ -129,6 +130,80 @@ python -m sales_forecast.train \
 ```
 
 
+## Hyperparameter Tuning (Vertex AI)
+- Status: The training script is hyperparameter-tuning ready. It accepts LightGBM params as CLI flags and reports a single objective metric (MAE/RMSE/R²) using the `hypertune` library so Vertex AI can select the best trial.
+- Default behavior: The provided pipeline and Cloud Run Jobs execute a single training run (no HPT) unless you explicitly create a Vertex Hyperparameter Tuning Job.
+
+Supported hyperparameter flags (subset):
+- `--learning-rate`, `--num-leaves`, `--max-depth`, `--min-child-samples`, `--feature-fraction`, `--bagging-fraction`, `--bagging-freq`, `--lambda-l1`, `--lambda-l2`, `--min-split-gain`, `--n-estimators`, `--objective`, `--metric`, `--boosting-type`, `--seed`, `--n-jobs`, `--early-stopping-rounds`.
+
+Metric reporting:
+- Pass `--hpt-metric-name mae` (or `rmse`, `r2`) to choose the objective. Alternatively set `HPT_METRIC_NAME` in the environment.
+
+Run a Vertex AI Hyperparameter Tuning Job (example in Python):
+```python
+from google.cloud import aiplatform
+from google.cloud.aiplatform import hyperparameter_tuning as hpt
+
+PROJECT_ID = "my-forecast-project-18870"
+REGION = "us-central1"
+IMAGE_URI = f"{REGION}-docker.pkg.dev/{PROJECT_ID}/sales-forecast-repo/sales-forecast:latest"
+SERVICE_ACCOUNT = f"ds-pipeline-sa@{PROJECT_ID}.iam.gserviceaccount.com"
+
+aiplatform.init(project=PROJECT_ID, location=REGION)
+
+custom_job = aiplatform.CustomJob(
+    display_name="sf-train",
+    worker_pool_specs=[{
+        "machine_spec": {"machine_type": "n1-standard-4"},
+        "replica_count": 1,
+        "container_spec": {
+            "image_uri": IMAGE_URI,
+            "command": ["python", "-m", "sales_forecast.train"],
+            "args": [
+                "--model-path", "/tmp/model.joblib",
+                "--hpt-metric-name", "mae"  # or "rmse" / "r2"
+            ],
+        },
+    }],
+)
+
+hpt_job = aiplatform.HyperparameterTuningJob(
+    display_name="sf-lgbm-hpt",
+    custom_job=custom_job,
+    metric_spec={"mae": "minimize"},  # must match --hpt-metric-name
+    parameter_spec={
+        "learning_rate": hpt.DoubleParameterSpec(min=0.01, max=0.2, scale="log"),
+        "num_leaves": hpt.IntegerParameterSpec(min=31, max=255, scale="linear"),
+        "max_depth": hpt.IntegerParameterSpec(min=-1, max=15, scale="linear"),
+        "feature_fraction": hpt.DoubleParameterSpec(min=0.6, max=1.0, scale="linear"),
+        "bagging_fraction": hpt.DoubleParameterSpec(min=0.6, max=1.0, scale="linear"),
+        "n_estimators": hpt.IntegerParameterSpec(min=200, max=2000, scale="linear"),
+    },
+    max_trial_count=20,
+    parallel_trial_count=4,
+)
+
+hpt_job.run(service_account=SERVICE_ACCOUNT, sync=True)
+
+best = hpt_job.trials[0]
+print("Best metric:", best.final_measurement.metrics)
+print("Best params:", best.parameters)
+```
+
+Notes:
+- During tuning, avoid passing a shared `--model-gcs-uri` to prevent trials from overwriting the same path.
+- After HPT finishes, retrain once with the best parameters to produce a single promoted artifact:
+```bash
+python -m sales_forecast.train \
+  --model-path /tmp/model.joblib \
+  --model-gcs-uri "gs://${PROJECT_ID}-staging/models/model.joblib" \
+  --learning-rate <best> --num-leaves <best> --max-depth <best> \
+  --feature-fraction <best> --bagging-fraction <best> --n-estimators <best> \
+  --hpt-metric-name mae
+```
+
+
 ## Inference (offline script)
 - Code: `src/sales_forecast/predict.py`
 - Loads model from local path or GCS, queries recent days from BigQuery to rebuild lag/rolling features, appends next day, and outputs a single-day forecast.
@@ -152,6 +227,8 @@ python -m sales_forecast.predict --model-gcs-uri "gs://${PROJECT_ID}-staging/mod
   - `register_and_deploy_op(model_artifact, ...)` → optional registration + deployment
 
 Note: The deploy step is gated. It runs only when `ENABLE_DEPLOY=true` and `SERVING_IMAGE_URI` is set and differs from `DOCKER_IMAGE_URI`. Otherwise it is skipped.
+
+HPT note: The current pipeline runs a single training task and does not launch a Hyperparameter Tuning Job. To tune, run a separate Vertex HPT job (see section above), then retrain once with best params.
 
 Compile and submit directly:
 ```bash
@@ -303,6 +380,7 @@ Common variables (can be set in `.env` and read by scripts/components):
 - **GCS_URI**: CSV path in GCS for ingestion
 - **MODEL_GCS_URI**: optional central model artifact URI
 - **ENABLE_DEPLOY**: set to `true` to let the pipeline register+deploy using `SERVING_IMAGE_URI` (default `false`).
+- **HPT_METRIC_NAME**: optional; when set, the training script reports this objective for Vertex HPT (`mae`, `rmse`, or `r2`).
 
 Scripts auto-load `.env` if present.
 

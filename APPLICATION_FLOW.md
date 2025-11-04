@@ -6,6 +6,7 @@ Below are the complete data and application flows for all supported ways to run 
 - Cloud Storage (GCS): object store for CSV input and model artifacts.
 - Artifact Registry: stores your built Docker container images.
 - Vertex AI Pipelines (Kubeflow v2): orchestrates your ML steps (ingest → train → predict → optional register/deploy).
+- Vertex AI Hyperparameter Tuning (Custom Training): runs parallel trials of your training container and selects the best hyperparameters.
 - Vertex AI Model Registry: catalog of your registered model versions (points to artifacts in GCS and a serving image).
 - Vertex AI Endpoints (Online Prediction): hosts your model for real-time predictions.
 - Cloud Build (optional): CI that builds and compiles the pipeline on push.
@@ -17,6 +18,9 @@ There are three main ways to run the full flow. Choose one:
 - A) Vertex AI Pipelines end-to-end (recommended when quotas are ready; serving/deploy is optional and gated).
 - B) Cloud Run Jobs orchestration (alternative to pipelines; does not deploy an endpoint by itself).
 - C) Split path: pipeline (or jobs) for ingest/train/predict, then a separate script to register/deploy an endpoint.
+
+Optional, orthogonal to A/B/C:
+- Vertex AI Hyperparameter Tuning: run HPT as a separate job against the same training image to search LightGBM parameters, then retrain once with the best params.
 
 I’ll walk through each option in detail.
 
@@ -33,6 +37,9 @@ Run this if you want an automated flow inside Vertex AI Pipelines, with optional
   - Deployment is controlled by `ENABLE_DEPLOY`. When `ENABLE_DEPLOY=true` and a `SERVING_IMAGE_URI` is provided, the pipeline’s optional deploy step runs.
   - `scripts/deploy_and_run.sh` will also ensure the serving image exists: if `ENABLE_DEPLOY=true` and the image is missing, it builds/pushes `Dockerfile.serve` to `SERVING_IMAGE_URI` automatically.
   - If `ENABLE_DEPLOY=false` (default), the pipeline runs ingest → train → offline predict only.
+
+HPT note:
+- The pipeline currently runs a single training task. It does not launch a Hyperparameter Tuning Job by itself. To tune, run a Vertex HPT job separately (see below), then retrain once with the best params to produce the promoted artifact.
 
 What happens when you run `./scripts/deploy_and_run.sh`:
 1) Local build and publish
@@ -66,6 +73,7 @@ What happens when you run `./scripts/deploy_and_run.sh`:
        - Reads the final BigQuery table.
        - Builds in-memory features (temporal, lag, rolling, one-hot) and splits by time.
        - Trains a LightGBM model, evaluates, and saves `model.joblib` to the component’s output path (Vertex mirrors it under your Pipeline Root bucket in GCS).
+      - Hyperparameter tuning readiness: accepts LightGBM params via CLI flags and reports a single objective metric (MAE/RMSE/R²) when `--hpt-metric-name` (or `HPT_METRIC_NAME`) is provided. The pipeline does not spawn HPT trials.
        - After completion: a model artifact is available as a pipeline output.
    - `predict_op(model_artifact)`:
      - Code invoked: `src/sales_forecast/predict.py`
@@ -94,6 +102,7 @@ What happens when you run `./scripts/deploy_and_run.sh`:
   - Clear versioning and discoverability for serving artifacts.
   - Avoids coupling serving to KFP’s internal artifact layout.
   - Aligns with build → promote → deploy best practices.
+  - HPT tip: Avoid having HPT trials write to the same `MODEL_GCS_URI`. Let each trial write locally only; after HPT completes, retrain once with the best params and upload to the stable models directory.
 
 ### How artifacts flow between steps (KFP)
 
@@ -193,10 +202,66 @@ Notes and outcomes:
 
 ---
 
+## Optional: Vertex AI Hyperparameter Tuning (standalone)
+Use this when you want to search LightGBM hyperparameters using Vertex AI’s Hyperparameter Tuning service.
+
+- Pre-reqs: Build and push the training image (same image used by the pipeline). The training script already reports the chosen objective metric via the `hypertune` library.
+- What it does: Submits many trials of your containerized trainer with different params; selects the best trial based on the metric you specify.
+- After HPT: Retrain once with the best params to produce a single promoted artifact and (optionally) register/deploy.
+
+Example (Python):
+```python
+from google.cloud import aiplatform
+from google.cloud.aiplatform import hyperparameter_tuning as hpt
+
+PROJECT_ID = "my-forecast-project-18870"
+REGION = "us-central1"
+IMAGE_URI = f"{REGION}-docker.pkg.dev/{PROJECT_ID}/sales-forecast-repo/sales-forecast:latest"
+SERVICE_ACCOUNT = f"ds-pipeline-sa@{PROJECT_ID}.iam.gserviceaccount.com"
+
+aiplatform.init(project=PROJECT_ID, location=REGION)
+
+custom_job = aiplatform.CustomJob(
+    display_name="sf-train",
+    worker_pool_specs=[{
+        "machine_spec": {"machine_type": "n1-standard-4"},
+        "replica_count": 1,
+        "container_spec": {
+            "image_uri": IMAGE_URI,
+            "command": ["python", "-m", "sales_forecast.train"],
+            "args": ["--model-path", "/tmp/model.joblib", "--hpt-metric-name", "mae"],
+        },
+    }],
+)
+
+hpt_job = aiplatform.HyperparameterTuningJob(
+    display_name="sf-lgbm-hpt",
+    custom_job=custom_job,
+    metric_spec={"mae": "minimize"},
+    parameter_spec={
+        "learning_rate": hpt.DoubleParameterSpec(min=0.01, max=0.2, scale="log"),
+        "num_leaves": hpt.IntegerParameterSpec(min=31, max=255, scale="linear"),
+        "max_depth": hpt.IntegerParameterSpec(min=-1, max=15, scale="linear"),
+        "feature_fraction": hpt.DoubleParameterSpec(min=0.6, max=1.0, scale="linear"),
+        "bagging_fraction": hpt.DoubleParameterSpec(min=0.6, max=1.0, scale="linear"),
+        "n_estimators": hpt.IntegerParameterSpec(min=200, max=2000, scale="linear"),
+    },
+    max_trial_count=20,
+    parallel_trial_count=4,
+)
+
+hpt_job.run(service_account=SERVICE_ACCOUNT, sync=True)
+```
+
+Then retrain once with best params, upload, and proceed with registration/deployment.
+
+---
+
 ## What each project file contributes in these flows
 - `src/sales_forecast/data_ingest.py`: creates dataset if needed, loads CSV from GCS to staging, builds final table `daily_sales_features` with proper types. Uses BigQuery.
 - `src/sales_forecast/features.py`: builds in-memory features (temporal, lag, rolling, one-hot) used by training and inference code.
 - `src/sales_forecast/train.py`: reads BigQuery, builds features, trains LightGBM, evaluates, and saves `model.joblib`. Can upload to GCS when a URI is provided.
+  - Hyperparameter-tuning ready: accepts LightGBM params via CLI flags and reports a single objective metric when requested, for Vertex AI HPT.
 - `src/sales_forecast/predict.py`: loads the model (local or from GCS), fetches recent data from BigQuery, rebuilds features, and predicts the next day. Prints result to logs.
 - `src/sales_forecast/serve_app.py`: FastAPI app for online predictions on Vertex AI Endpoints; loads model from `AIP_STORAGE_URI`, `MODEL_GCS_URI`, or `MODEL_PATH`.
 - `pipeline/forecast_pipeline.py`: defines KFP v2 components and the pipeline graph; compiles and submits to Vertex AI Pipelines; the deploy step is optional and gated.
@@ -234,6 +299,9 @@ Notes and outcomes:
 - **How do KFP artifact parameters work?**
   - Output artifacts receive an injected path (`dsl.OutputPath(...)`) to write to; input artifacts are accessed via `.path` on `dsl.Input[...]` parameters. KFP mirrors these under `PIPELINE_ROOT`.
 
+- **Does it do hyperparameter tuning automatically?**
+  - The pipeline and Cloud Run Jobs run a single training task. The training code is HPT-ready, but you launch tuning as a separate Vertex AI Hyperparameter Tuning Job. After it finishes, retrain once with the best params and promote that artifact.
+
 ---
 
 ## Which file do I run for each path?
@@ -247,6 +315,9 @@ Notes and outcomes:
 
 - Dedicated serving deployment:
   - `./scripts/build_and_deploy_serving.sh` (assumes a trained model artifact exists in GCS and builds/pushes `Dockerfile.serve`)
+
+- Hyperparameter tuning (standalone):
+  - Submit a Vertex Hyperparameter Tuning Job using the training image and `sales_forecast.train` entrypoint (see code snippet above). When complete, retrain once with the best params to produce your promoted artifact.
 
 - Online call:
   - `python scripts/endpoint_predict.py --project-id ... --region ... --endpoint-id ... --instances '[{...}]'`
