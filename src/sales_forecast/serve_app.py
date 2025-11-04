@@ -99,4 +99,8 @@ def predict(req: PredictRequest) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/v1/endpoints/{endpoint_id}/deployedModels/{deployed_model_id}")
+def vertex_probe(endpoint_id: str, deployed_model_id: str) -> Dict[str, str]:
+    return {"status": "healthy"}
+
 

@@ -20,6 +20,8 @@ ENV PYTHONPATH="/app/src:/app"
 
 # Vertex probes port 8080 by default
 ENV AIP_HTTP_PORT=8080
+ENV AIP_HEALTH_ROUTE=/health
+ENV AIP_PREDICT_ROUTE=/predict
 
 # Start FastAPI app (sales_forecast.serve_app:app) with uvicorn
 EXPOSE 8080

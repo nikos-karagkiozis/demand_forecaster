@@ -68,6 +68,8 @@ def register_model(
         display_name=display_name,
         artifact_uri=artifact_uri,
         serving_container_image_uri=container_uri,
+        serving_container_predict_route="/predict",
+        serving_container_health_route="/health",
         labels=parse_labels(labels),
         sync=True,
     )
