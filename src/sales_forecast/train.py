@@ -172,7 +172,7 @@ def main(
         'objective': 'regression_l2',
         'metric': 'rmse',
         'n_estimators': 1000,
-        'learning_rate': 0.05,
+        'learning_rate': 0.61,
         'feature_fraction': 0.8,
         'bagging_fraction': 0.8,
         'bagging_freq': 1,
