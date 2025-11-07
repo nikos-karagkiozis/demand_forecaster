@@ -333,3 +333,5 @@ Then retrain once with best params, upload, and proceed with registration/deploy
 - Inference reads the last days from the final table, reconstructs features, and makes a next-day forecast.
 - If you register and deploy, Vertex AI hosts your model behind an endpoint so applications can send JSON and receive predictions instantly.
 - You can orchestrate all of this in Vertex AI Pipelines (recommended), run it as Cloud Run Jobs (alternative), or split training and serving into separate runs as needed.
+
+test
