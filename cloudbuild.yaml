@@ -3,11 +3,35 @@ substitutions:
   _REGION: "us-central1"
   _REPO: "sales-forecast-repo"
   _IMAGE: "sales-forecast"
+  _SUBMIT: "false"
 
 options:
   logging: CLOUD_LOGGING_ONLY
 
 steps:
+  # Lint and type-check (lightweight, PR-friendly)
+  - name: python:3.12
+    id: "lint and type-check (light)"
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        python -m pip install --quiet ruff mypy
+        ruff check .
+        mypy src/sales_forecast/features.py --ignore-missing-imports
+
+  # Unit tests (lightweight): smoke test features module only
+  - name: python:3.12
+    id: "unit tests (light)"
+    entrypoint: bash
+    env:
+      - "PYTHONPATH=./src"
+    args:
+      - -c
+      - |
+        python -m pip install --quiet pytest pandas numpy
+        pytest -q
+
   # Authenticate to Artifact Registry for the regional host
   - name: gcr.io/cloud-builders/gcloud
     id: "auth artifact registry"
@@ -38,6 +62,7 @@ steps:
       - "REGION=${_REGION}"
       - "DOCKER_IMAGE_URI=${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_IMAGE}:$COMMIT_SHA"
       - "PIPELINE_ROOT=gs://${_PROJECT_ID}-staging/pipeline_root"
+      - "SUBMIT_PIPELINE=false"
     args:
       - -c
       - |
@@ -51,14 +76,19 @@ steps:
     env:
       - "PROJECT_ID=${_PROJECT_ID}"
       - "REGION=${_REGION}"
+      - "_SUBMIT=${_SUBMIT}"
     args:
       - -c
       - |
-        gcloud ai pipelines run \
-          --project=${_PROJECT_ID} \
-          --region=${_REGION} \
-          --pipeline-file=forecast_pipeline.json \
-          --display-name="sales-forecast-pipeline-$COMMIT_SHA" || true
+        if [ "${_SUBMIT}" = "true" ]; then
+          gcloud ai pipelines run \
+            --project=${_PROJECT_ID} \
+            --region=${_REGION} \
+            --pipeline-file=forecast_pipeline.json \
+            --display-name="sales-forecast-pipeline-$COMMIT_SHA" || true
+        else
+          echo "Skipping pipeline submission because _SUBMIT is false."
+        fi
 
 images:
   - "${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_IMAGE}:$COMMIT_SHA"

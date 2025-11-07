@@ -179,18 +179,23 @@ if __name__ == "__main__":
     # Compile the pipeline into a JSON file
     Compiler().compile(pipeline_func=forecast_pipeline, package_path="forecast_pipeline.json")
 
-    # Initialize the Vertex AI client
-    aiplatform.init(project=PROJECT_ID, location=REGION)
+    # Optionally submit the pipeline, gated by env var
+    submit_pipeline = os.environ.get("SUBMIT_PIPELINE", "false").lower() in ("1", "true", "yes", "on")
+    if submit_pipeline:
+        # Initialize the Vertex AI client
+        aiplatform.init(project=PROJECT_ID, location=REGION)
 
-    # Define the pipeline job
-    job = aiplatform.PipelineJob(
-        display_name="sales-forecast-pipeline-run",
-        template_path="forecast_pipeline.json",
-        pipeline_root=PIPELINE_ROOT,
-        enable_caching=True # Use cached results for unchanged steps
-    )
+        # Define the pipeline job
+        job = aiplatform.PipelineJob(
+            display_name="sales-forecast-pipeline-run",
+            template_path="forecast_pipeline.json",
+            pipeline_root=PIPELINE_ROOT,
+            enable_caching=True # Use cached results for unchanged steps
+        )
 
-    print("Submitting pipeline job to Vertex AI...")
-    # Set sync=False to run the pipeline asynchronously.
-    job.run(service_account=SERVICE_ACCOUNT, sync=False)
-    print("Pipeline job submitted. Check the Vertex AI console for progress.")
+        print("Submitting pipeline job to Vertex AI...")
+        # Set sync=False to run the pipeline asynchronously.
+        job.run(service_account=SERVICE_ACCOUNT, sync=False)
+        print("Pipeline job submitted. Check the Vertex AI console for progress.")
+    else:
+        print("Skipping pipeline submission (set SUBMIT_PIPELINE=true to submit).")
